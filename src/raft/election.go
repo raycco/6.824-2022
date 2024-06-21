@@ -1,0 +1,228 @@
+package raft
+
+import (
+	"fmt"
+	"math/rand"
+	"time"
+)
+
+const (
+	FOLLOWER = iota
+	CANDIDATE
+	LEADER
+)
+
+const ElectionTimeout = 150 * time.Millisecond
+const LeaderHeartbeatsTimeout = 100 * time.Millisecond
+
+// example RequestVote RPC arguments structure.
+// field names must start with capital letters!
+type RequestVoteArgs struct {
+	// Your data here (2A, 2B).
+	Term         int
+	CandidateId  int
+	LastLogIndex uint64
+	LastLogTerm  int
+}
+
+func (reqVoteArgs *RequestVoteArgs) str() string {
+	return fmt.Sprintf("[T%d, S%d, LLI %d, LLT %d]",
+		reqVoteArgs.Term, reqVoteArgs.CandidateId, reqVoteArgs.LastLogIndex, reqVoteArgs.LastLogTerm)
+}
+
+// example RequestVote RPC reply structure.
+// field names must start with capital letters!
+type RequestVoteReply struct {
+	// Your data here (2A).
+	Term        int
+	VoteGranted bool
+}
+
+func (reqVoteReply *RequestVoteReply) str() string {
+	return fmt.Sprintf("[T%d, GRANT %t]", reqVoteReply.Term, reqVoteReply.VoteGranted)
+}
+
+type VoteReplyMsg struct {
+	ok     bool
+	server int
+	reply  RequestVoteReply
+}
+
+// example RequestVote RPC handler.
+func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+	// Your code here (2A, 2B).
+	//Dbg(dVote, "S%d receive vote req from S%d", rf.me, args.CandidateId)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	Dbg(dVote, "S%d [T%d VF %d LLI %d STATE %d] receive vote req from S%d %s",
+		rf.me, rf.currentTerm, rf.votedFor, rf.commitIndex, rf.state, args.CandidateId, args.str())
+
+	myTerm := rf.currentTerm
+	myLLIndex := rf.lastLogIndex()
+
+	reply.Term = myTerm
+
+	if args.Term > myTerm {
+		rf.convertToFollower(args.Term)
+	}
+
+	if args.Term <= myTerm || (rf.votedFor != -1 && args.CandidateId != rf.votedFor) {
+		reply.VoteGranted = false
+		return
+	}
+
+	if args.LastLogTerm < rf.log[myLLIndex].Term || (args.LastLogTerm == myTerm && args.LastLogIndex < myLLIndex) {
+		reply.VoteGranted = false
+		return
+	}
+
+	rf.votedFor = args.CandidateId
+	reply.VoteGranted = true
+	rf.resetElectionTimeout(rf.me)
+}
+
+// example code to send a RequestVote RPC to a server.
+// server is the index of the target server in rf.peers[].
+// expects RPC arguments in args.
+// fills in *reply with RPC reply, so caller should
+// pass &reply.
+// the types of the args and reply passed to Call() must be
+// the same as the types of the arguments declared in the
+// handler function (including whether they are pointers).
+//
+// The labrpc package simulates a lossy network, in which servers
+// may be unreachable, and in which requests and replies may be lost.
+// Call() sends a request and waits for a reply. If a reply arrives
+// within a timeout interval, Call() returns true; otherwise
+// Call() returns false. Thus Call() may not return for a while.
+// A false return can be caused by a dead server, a live server that
+// can't be reached, a lost request, or a lost reply.
+//
+// Call() is guaranteed to return (perhaps after a delay) *except* if the
+// handler function on the server side does not return.  Thus there
+// is no need to implement your own timeouts around Call().
+//
+// look at the comments in ../labrpc/labrpc.go for more details.
+//
+// if you're having trouble getting RPC to work, check that you've
+// capitalized all field names in structs passed over RPC, and
+// that the caller passes the address of the reply struct with &, not
+// the struct itself.
+func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	return ok
+}
+
+func (rf *Raft) convertToFollower(term int) {
+	rf.state = FOLLOWER
+	rf.currentTerm = term
+	rf.votedFor = -1
+}
+
+func (rf *Raft) convertToCandidate() {
+	rf.state = CANDIDATE
+	rf.currentTerm += 1
+	rf.votedFor = rf.me
+}
+
+func (rf *Raft) convertToLeader() {
+	rf.state = LEADER
+	rf.votedFor = -1
+
+	Dbg(dLeader, "S%d victory T%d", rf.me, rf.currentTerm)
+}
+
+func (rf *Raft) startElection() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	rf.convertToCandidate()
+	voteCount := 1
+
+	myLLIndex := rf.lastLogIndex()
+	args := &RequestVoteArgs{rf.currentTerm, rf.me, myLLIndex, rf.log[myLLIndex].Term}
+	for peer := 0; peer < len(rf.peers); peer++ {
+		if peer != rf.me {
+			go func(server int, term int, args *RequestVoteArgs) {
+				var reply RequestVoteReply
+				Dbg(dVote, "S%d send vote req to S%d T%d", rf.me, server, term)
+				ok := rf.sendRequestVote(server, args, &reply)
+
+				//rf.voteCh <- VoteReplyMsg{ok, server, reply}
+				if ok {
+					rf.mu.Lock()
+					defer rf.mu.Unlock()
+
+					myTerm := rf.currentTerm
+					Dbg(dVote, "S%d receive vote reply S%d CNT %d, Grant %t T%d my T%d\n",
+						rf.me, server, voteCount, reply.VoteGranted, reply.Term, myTerm)
+
+					if reply.VoteGranted {
+						voteCount += 1
+						if voteCount > len(rf.peers)/2 {
+							voteCount = 0
+							rf.convertToLeader()
+							rf.sendHeartbeats()
+						}
+					} else {
+						if reply.Term > myTerm {
+							rf.convertToFollower(reply.Term)
+						}
+					}
+				}
+			}(peer, rf.currentTerm, args)
+		}
+	}
+
+	/*rf.mu.Lock()
+	defer rf.mu.Unlock()
+	for i := 0; i < len(rf.peers)-1; i++ {
+
+		select {
+		case replyMsg := <-voteCh:
+			Dbg(dVote, "S%d receive vote reply S%d RET %t", rf.me, replyMsg.server, replyMsg.ok)
+			if replyMsg.ok {
+				Dbg(dVote, "S%d receive vote reply S%d CNT %d, Grant %t\n", rf.me, replyMsg.server, rf.count, replyMsg.reply.VoteGranted)
+				if replyMsg.reply.VoteGranted {
+					rf.count += 1
+					if rf.count > len(rf.peers)/2 {
+						rf.electionEnd(false)
+						return
+					}
+				} else {
+					if rf.currentTerm < replyMsg.reply.Term {
+						rf.currentTerm = replyMsg.reply.Term
+					}
+				}
+			}
+		case <-time.After(1000*time.Millisecond + time.Duration(rand.Intn(300))*time.Millisecond):
+			Dbg(dTimer, "S%d election time out: CNT = %d, peers = %d\n", rf.me, rf.count, len(rf.peers))
+			rf.electionEnd(true)
+			return
+		}
+	}*/
+}
+
+func (rf *Raft) setElectionTimeTimeout() {
+	rf.electionTime = ElectionTimeout + time.Duration(rand.Intn(150))*time.Millisecond
+}
+
+func (rf *Raft) resetElectionTimeout(server int) {
+	go func(server int) {
+		rf.voteCh <- true
+	}(server)
+}
+
+func (rf *Raft) doElection() {
+
+	rf.setElectionTimeTimeout()
+	select {
+	case <-rf.voteCh:
+		Dbg(dVote, "S%d reset timer", rf.me)
+
+	case <-time.After(rf.electionTime):
+		Dbg(dVote, "S%d timeout, next election", rf.me)
+		rf.startElection()
+	}
+}
