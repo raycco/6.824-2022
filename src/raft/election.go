@@ -19,23 +19,23 @@ const LeaderHeartbeatsTimeout = 100 * time.Millisecond
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	Term         int
-	CandidateId  int
-	LastLogIndex uint64
-	LastLogTerm  int
+	Term         int // candidate’s term
+	CandidateId  int // candidate requesting vote
+	LastLogIndex int // index of candidate’s last log entry
+	LastLogTerm  int // term of candidate’s last log entry
 }
 
 func (reqVoteArgs *RequestVoteArgs) str() string {
-	return fmt.Sprintf("[T%d, S%d, LLI %d, LLT %d]",
-		reqVoteArgs.Term, reqVoteArgs.CandidateId, reqVoteArgs.LastLogIndex, reqVoteArgs.LastLogTerm)
+	return fmt.Sprintf("[T=%d LLI=%d LLT=%d]",
+		reqVoteArgs.Term, reqVoteArgs.LastLogIndex, reqVoteArgs.LastLogTerm)
 }
 
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	// Your data here (2A).
-	Term        int
-	VoteGranted bool
+	Term        int  // currentTerm, for candidate to update itself
+	VoteGranted bool // true means candidate received vote
 }
 
 func (reqVoteReply *RequestVoteReply) str() string {
@@ -55,11 +55,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	Dbg(dVote, "S%d [T%d VF %d LLI %d STATE %d] receive vote req from S%d %s",
-		rf.me, rf.currentTerm, rf.votedFor, rf.commitIndex, rf.state, args.CandidateId, args.str())
-
 	myTerm := rf.currentTerm
 	myLLIndex := rf.lastLogIndex()
+
+	Dbg(dVote, "S%d [T=%d VF=%d LLI=%d LLT=%d ST=%d CI=%d] receive vote req from S%d %s",
+		rf.me, rf.currentTerm, rf.votedFor, rf.lastLogIndex(), rf.log[myLLIndex].Term,
+		rf.state, rf.commitIndex, args.CandidateId, args.str())
 
 	reply.Term = myTerm
 
@@ -72,7 +73,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
-	if args.LastLogTerm < rf.log[myLLIndex].Term || (args.LastLogTerm == myTerm && args.LastLogIndex < myLLIndex) {
+	if args.LastLogTerm < rf.log[myLLIndex].Term ||
+		(args.LastLogTerm == rf.log[myLLIndex].Term && args.LastLogIndex < myLLIndex) {
 		reply.VoteGranted = false
 		return
 	}
@@ -131,6 +133,9 @@ func (rf *Raft) convertToLeader() {
 	rf.votedFor = -1
 
 	Dbg(dLeader, "S%d victory T%d", rf.me, rf.currentTerm)
+	for peer := 0; peer < len(rf.peers); peer++ {
+		rf.nextIndex[peer] = rf.lastLogIndex() + 1
+	}
 }
 
 func (rf *Raft) startElection() {
@@ -144,9 +149,9 @@ func (rf *Raft) startElection() {
 	args := &RequestVoteArgs{rf.currentTerm, rf.me, myLLIndex, rf.log[myLLIndex].Term}
 	for peer := 0; peer < len(rf.peers); peer++ {
 		if peer != rf.me {
-			go func(server int, term int, args *RequestVoteArgs) {
+			go func(server int, args *RequestVoteArgs) {
 				var reply RequestVoteReply
-				Dbg(dVote, "S%d send vote req to S%d T%d", rf.me, server, term)
+				Dbg(dVote, "S%d send vote req to S%d T=%d", rf.me, server, args.Term)
 				ok := rf.sendRequestVote(server, args, &reply)
 
 				//rf.voteCh <- VoteReplyMsg{ok, server, reply}
@@ -154,24 +159,23 @@ func (rf *Raft) startElection() {
 					rf.mu.Lock()
 					defer rf.mu.Unlock()
 
-					myTerm := rf.currentTerm
-					Dbg(dVote, "S%d receive vote reply S%d CNT %d, Grant %t T%d my T%d\n",
-						rf.me, server, voteCount, reply.VoteGranted, reply.Term, myTerm)
+					Dbg(dVote, "S%d receive vote reply S%d CNT=%d, Grant=%t T=%d my T=%d\n",
+						rf.me, server, voteCount, reply.VoteGranted, reply.Term, rf.currentTerm)
+
+					if reply.Term > rf.currentTerm {
+						rf.convertToFollower(reply.Term)
+					}
 
 					if reply.VoteGranted {
 						voteCount += 1
-						if voteCount > len(rf.peers)/2 {
+						if voteCount > len(rf.peers)/2 && args.Term == rf.currentTerm {
 							voteCount = 0
 							rf.convertToLeader()
 							rf.sendHeartbeats()
 						}
-					} else {
-						if reply.Term > myTerm {
-							rf.convertToFollower(reply.Term)
-						}
 					}
 				}
-			}(peer, rf.currentTerm, args)
+			}(peer, args)
 		}
 	}
 
