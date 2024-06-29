@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"reflect"
 	"strconv"
 	"time"
+	"unsafe"
 )
 
 // Debugging
@@ -70,4 +72,22 @@ func Dbg(topic logTopic, format string, a ...interface{}) {
 		format = prefix + format
 		log.Printf(format, a...)
 	}
+}
+
+func entryByteSize(arr interface{}) uint64 {
+	arrValue := reflect.ValueOf(arr)
+	if arrValue.Kind() != reflect.String {
+		return uint64(unsafe.Sizeof(arr))
+	} else {
+		return uint64(arrValue.Len())
+	}
+}
+
+func logEntryByteSize(log []LogEntry) uint64 {
+	var byteSize uint64
+	byteSize = 0
+	for _, entry := range log {
+		byteSize += (uint64)(unsafe.Sizeof(entry.Term)) + entryByteSize(entry.Command)
+	}
+	return byteSize
 }

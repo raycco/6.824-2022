@@ -135,6 +135,7 @@ func (rf *Raft) convertToLeader() {
 	Dbg(dLeader, "S%d victory T%d", rf.me, rf.currentTerm)
 	for peer := 0; peer < len(rf.peers); peer++ {
 		rf.nextIndex[peer] = rf.lastLogIndex() + 1
+		rf.matchIndex[peer] = rf.commitIndex
 	}
 }
 

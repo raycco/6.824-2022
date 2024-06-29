@@ -198,7 +198,12 @@ func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *Requ
 		reply.Success = false
 		return
 	} else if len(args.Entries) > 0 {
-		//Dbg(dLog, "S%d log %+v entries %+v", rf.me, rf.log, args.Entries)
+		if logEntryByteSize(rf.log) < 4096 && logEntryByteSize(args.Entries) < 4096 {
+			Dbg(dLog, "S%d log szie %d log %+v entries %+v", rf.me, logEntryByteSize(rf.log), rf.log, args.Entries)
+		} else {
+			Dbg(dLog, "S%d log size %d entries size %d", rf.me, logEntryByteSize(rf.log), logEntryByteSize(args.Entries))
+		}
+
 		index := args.PrevLogIndex + 1
 		for i := 0; i < len(args.Entries) && index <= rf.lastLogIndex(); i++ {
 			if rf.log[index].Term != args.Entries[i].Term {
@@ -209,7 +214,12 @@ func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *Requ
 		}
 		conflictIndex := index - (args.PrevLogIndex + 1)
 		rf.log = append(rf.log, args.Entries[conflictIndex:]...)
-		//Dbg(dLog, "S%d log %+v", rf.me, rf.log)
+
+		if logEntryByteSize(rf.log) < 4096 {
+			Dbg(dLog, "S%d log szie %d log %+v", rf.me, logEntryByteSize(rf.log), rf.log)
+		} else {
+			Dbg(dLog, "S%d log size %d", rf.me, logEntryByteSize(rf.log))
+		}
 	}
 
 	if args.LeaderCommit > rf.commitIndex {
@@ -219,14 +229,12 @@ func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *Requ
 		} else {
 			rf.commitIndex = rf.lastLogIndex()
 		}
-		for index := prevIndex; index <= rf.commitIndex; index++ {
-			rf.applyCh <- ApplyMsg{true, rf.log[index].Command, index, false, nil, 0, 0}
-		}
+		rf.applyMessage(prevIndex)
 	}
-	for i := 0; i < len(rf.peers); i++ {
+	/*for i := 0; i < len(rf.peers); i++ {
 		rf.matchIndex[i] = rf.lastLogIndex()
 		rf.nextIndex[i] = rf.lastLogIndex() + 1
-	}
+	}*/
 	reply.Success = true
 }
 
@@ -298,19 +306,27 @@ func (rf *Raft) resetLeaderHeastbeatsTimeout(server int) {
 	rf.resetElectionTimeout(server)
 }
 
-func (rf *Raft) commitLog() {
+func (rf *Raft) applyMessage(startCommitIndex int) {
+	for index := startCommitIndex; index <= rf.commitIndex; index++ {
+		if index > rf.lastApplied {
+			rf.lastApplied = index
+			rf.applyCh <- ApplyMsg{true, rf.log[index].Command, index, false, nil, 0, 0}
+		}
+	}
 }
 
 func (rf *Raft) prepareAppendEntriesArgs(peer int, heartbeats bool) *RequestAppendEntriesArgs {
+
 	myLLIndex := rf.lastLogIndex()
-	prevLogIndex := rf.matchIndex[peer]
+	//prevLogIndex := rf.matchIndex[peer]
+	prevLogIndex := rf.nextIndex[peer] - 1
 	prevLogTerm := rf.log[prevLogIndex].Term
+
 	args := &RequestAppendEntriesArgs{rf.currentTerm, rf.me, prevLogTerm, prevLogIndex, rf.commitIndex, nil}
 
 	if myLLIndex >= rf.nextIndex[peer] {
 		args.Entries = make([]LogEntry, len(rf.log)-rf.nextIndex[peer])
 		copy(args.Entries, rf.log[rf.nextIndex[peer]:])
-
 	}
 	Dbg(dLeader, "S%d send append entries to S%d [T=%d LLI=%d LLT=%d PLI=%d PLT=%d NI=%d MI=%d CI=%d HR=%t]",
 		rf.me, peer, args.Term, myLLIndex, rf.log[myLLIndex].Term, args.PrevLogIndex, args.PrevLogTerm,
@@ -319,9 +335,51 @@ func (rf *Raft) prepareAppendEntriesArgs(peer int, heartbeats bool) *RequestAppe
 	return args
 }
 
-func (rf *Raft) sendAppendEntries(heartbeats bool) {
+func (rf *Raft) processAppendEntriesReply(peer int, args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
-	syncLogCount := 1
+	if reply.Term > rf.currentTerm {
+		rf.convertToFollower(reply.Term)
+	}
+
+	if reply.Success {
+
+		if args.Term == rf.currentTerm {
+			rf.matchIndex[peer] = args.PrevLogIndex + len(args.Entries)
+			rf.nextIndex[peer] = rf.matchIndex[peer] + 1
+		}
+
+		count := 1
+		minIndex := rf.matchIndex[peer]
+		for i := 0; i < len(rf.matchIndex); i++ {
+			if i != rf.me && rf.matchIndex[i] > rf.commitIndex {
+				count++
+				if rf.matchIndex[i] < minIndex { // the min index for commit
+					minIndex = rf.matchIndex[i]
+				}
+			}
+		}
+
+		if count > len(rf.peers)/2 && rf.log[minIndex].Term == rf.currentTerm {
+			rf.commitIndex = minIndex
+
+			Dbg(dLeader, "S%d receive append entries reply from S%d T=%d CI=%d", rf.me, peer, args.Term, rf.commitIndex)
+
+			rf.applyMessage(rf.matchIndex[rf.me])
+			rf.matchIndex[rf.me] = rf.commitIndex
+			rf.nextIndex[rf.me] = rf.matchIndex[rf.me] + 1
+		}
+	} else {
+		Dbg(dLeader, "S%d receive append entries reply from S%d [T=%d ST=%d <- T=%d]", rf.me, peer, args.Term, rf.state, rf.currentTerm)
+		if args.Term == rf.currentTerm {
+			rf.nextIndex[peer] -= 1
+			//rf.matchIndex[peer] -= 1
+		}
+	}
+}
+
+func (rf *Raft) sendAppendEntries(heartbeats bool) {
 
 	for peer := 0; peer < len(rf.peers); peer++ {
 		if peer != rf.me {
@@ -335,40 +393,7 @@ func (rf *Raft) sendAppendEntries(heartbeats bool) {
 				ok := rf.sendRequestAppendEntries(server, args, &reply)
 
 				if ok {
-					rf.mu.Lock()
-					defer rf.mu.Unlock()
-
-					if reply.Term > rf.currentTerm {
-						rf.convertToFollower(reply.Term)
-					}
-
-					if reply.Success {
-
-						if args.Term == rf.currentTerm {
-							syncLogCount += 1
-							rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
-							rf.nextIndex[server] = rf.matchIndex[server] + 1
-						}
-
-						if syncLogCount > len(rf.peers)/2 && args.Term == rf.currentTerm {
-							syncLogCount = 0
-							rf.commitIndex = args.PrevLogIndex + len(args.Entries)
-
-							Dbg(dLeader, "S%d receive append entries reply from S%d T=%d CI=%d", rf.me, server, args.Term, rf.commitIndex)
-
-							for index := rf.matchIndex[rf.me]; index <= rf.commitIndex; index++ {
-								rf.applyCh <- ApplyMsg{true, rf.log[index].Command, index, false, nil, 0, 0}
-							}
-							rf.matchIndex[rf.me] = rf.commitIndex
-							rf.nextIndex[rf.me] = rf.matchIndex[rf.me] + 1
-						}
-					} else {
-						Dbg(dLeader, "S%d receive append entries reply from S%d [T=%d ST=%d <- T=%d]", rf.me, server, args.Term, rf.state, rf.currentTerm)
-						if args.Term == rf.currentTerm {
-							rf.nextIndex[server] -= 1
-							rf.matchIndex[server] -= 1
-						}
-					}
+					rf.processAppendEntriesReply(server, args, &reply)
 				}
 			}(peer, args)
 		} else {
@@ -436,9 +461,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.nextIndex = make([]int, len(peers))
 	rf.matchIndex = make([]int, len(peers))
-	for peer := 0; peer < len(peers); peer++ {
-		rf.matchIndex[peer] = 0
-	}
 
 	rand.New(rand.NewSource(time.Now().UnixNano()))
 
