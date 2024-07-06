@@ -39,7 +39,7 @@ type RequestVoteReply struct {
 }
 
 func (reqVoteReply *RequestVoteReply) str() string {
-	return fmt.Sprintf("[T%d, GRANT %t]", reqVoteReply.Term, reqVoteReply.VoteGranted)
+	return fmt.Sprintf("[T=%d GRANT=%t]", reqVoteReply.Term, reqVoteReply.VoteGranted)
 }
 
 type VoteReplyMsg struct {
@@ -51,7 +51,7 @@ type VoteReplyMsg struct {
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	//Dbg(dVote, "S%d receive vote req from S%d", rf.me, args.CandidateId)
+	//Dbg(dVote, "S%d RequestVote S%d T%d", rf.me, args.CandidateId, args.Term)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -132,6 +132,9 @@ func (rf *Raft) convertToLeader() {
 	rf.state = LEADER
 	rf.votedFor = -1
 
+	// other algorithms must send redundant log entries to renumber them before they can be committed
+	// rf.log = append(rf.log, LogEntry{rf.currentTerm, nil}) // no-op
+
 	Dbg(dLeader, "S%d victory T%d", rf.me, rf.currentTerm)
 	for peer := 0; peer < len(rf.peers); peer++ {
 		rf.nextIndex[peer] = rf.lastLogIndex() + 1
@@ -140,8 +143,8 @@ func (rf *Raft) convertToLeader() {
 }
 
 func (rf *Raft) startElection() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	//rf.mu.Lock()
+	//defer rf.mu.Unlock()
 
 	rf.convertToCandidate()
 	voteCount := 1
@@ -152,7 +155,7 @@ func (rf *Raft) startElection() {
 		if peer != rf.me {
 			go func(server int, args *RequestVoteArgs) {
 				var reply RequestVoteReply
-				Dbg(dVote, "S%d send vote req to S%d T=%d", rf.me, server, args.Term)
+				Dbg(dVote, "S%d %s send vote request to S%d", rf.me, args.str(), server)
 				ok := rf.sendRequestVote(server, args, &reply)
 
 				//rf.voteCh <- VoteReplyMsg{ok, server, reply}
@@ -160,8 +163,8 @@ func (rf *Raft) startElection() {
 					rf.mu.Lock()
 					defer rf.mu.Unlock()
 
-					Dbg(dVote, "S%d receive vote reply S%d CNT=%d, Grant=%t T=%d my T=%d\n",
-						rf.me, server, voteCount, reply.VoteGranted, reply.Term, rf.currentTerm)
+					Dbg(dVote, "S%d [T=%d CNT=%d ArgsT=%d] receive vote reply from S%d %s\n",
+						rf.me, rf.currentTerm, voteCount, args.Term, server, reply.str())
 
 					if reply.Term > rf.currentTerm {
 						rf.convertToFollower(reply.Term)
@@ -209,25 +212,36 @@ func (rf *Raft) startElection() {
 	}*/
 }
 
-func (rf *Raft) setElectionTimeTimeout() {
-	rf.electionTime = ElectionTimeout + time.Duration(rand.Intn(150))*time.Millisecond
+func (rf *Raft) setElectionTimeout() {
+	rf.electionTimeout = ElectionTimeout + time.Duration(rand.Intn(150))*time.Millisecond
 }
 
 func (rf *Raft) resetElectionTimeout(server int) {
+
 	go func(server int) {
+		Dbg(dTimer, "S%d reset election timeout", server)
 		rf.voteCh <- true
 	}(server)
 }
 
 func (rf *Raft) doElection() {
 
-	rf.setElectionTimeTimeout()
 	select {
 	case <-rf.voteCh:
-		Dbg(dVote, "S%d reset timer", rf.me)
+		rf.mu.Lock()
+		rf.lastElectionTimeout = rf.electionTimeout
+		rf.setElectionTimeout()
+		Dbg(dTimer, "S%d reset election timeout=%d", rf.me, rf.electionTimeout/time.Millisecond)
+		rf.mu.Unlock()
 
-	case <-time.After(rf.electionTime):
-		Dbg(dVote, "S%d timeout, next election", rf.me)
-		rf.startElection()
+	case <-time.After(rf.electionTimeout):
+		rf.mu.Lock()
+		Dbg(dTimer, "S%d timeout, next election", rf.me)
+		if rf.lastElectionTimeout == rf.electionTimeout {
+			rf.startElection()
+		} else {
+			rf.lastElectionTimeout = rf.electionTimeout
+		}
+		rf.mu.Unlock()
 	}
 }
