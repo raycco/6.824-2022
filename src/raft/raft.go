@@ -93,6 +93,15 @@ type Raft struct {
 	applyCh chan ApplyMsg
 
 	applierCh chan int
+
+	lastIncludedIndex int
+	lastIncludedTerm  int
+	lastSnapshot      []byte
+	needApplySnapshot bool
+
+	newSnapshot      []byte
+	newIncludedIndex int
+	newIncludedTerm  int
 }
 
 func logStr(log []LogEntry) string {
@@ -256,7 +265,33 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
+	rf.lastIncludedTerm = rf.log[rf.realLogIndex(index)].Term
+
+	Dbg(dSnap, "S%d snapshot last include index %d term %d, log %s", rf.me, rf.lastIncludedIndex, rf.lastIncludedTerm, logStr(rf.log))
+
+	var log []LogEntry
+	log = append(log, rf.log[0])
+	trimIndex := rf.realLogIndex(index + 1)
+	if trimIndex <= rf.lastLogIndex() {
+		log = append(log, rf.log[trimIndex:]...)
+	}
+
+	rf.log = log
+	//rf.log = append(rf.log[:0], rf.log[index+1:]...)
+
+	Dbg(dSnap, "S%d snapshot last include index %d term %d, trim log %s", rf.me, rf.lastIncludedIndex, rf.lastIncludedTerm, logStr(rf.log))
+
+	rf.lastIncludedIndex = index
+	rf.lastSnapshot = make([]byte, len(snapshot))
+	copy(rf.lastSnapshot, snapshot)
+	rf.needApplySnapshot = true
+	rf.notifyApply(rf.lastIncludedIndex)
+
+	rf.persist()
+	rf.persister.SaveStateAndSnapshot(rf.persister.ReadRaftState(), snapshot)
 }
 
 type RequestAppendEntriesArgs struct {
@@ -284,10 +319,9 @@ func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *Requ
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	Dbg(dLog, "S%d [T=%d LLI=%d LLT=%d ST=%d NI=%d MI=%d CI=%d] receive append entries from S%d %s HR=%d",
+	Dbg(dLog, "S%d [T=%d LLI=%d LLT=%d ST=%d CI=%d LII=%d LIT=%d] receive append entries from S%d %s HR=%d",
 		rf.me, rf.currentTerm, rf.lastLogIndex(), rf.log[rf.lastLogIndex()].Term, rf.state,
-		rf.nextIndex[rf.me], rf.matchIndex[rf.me],
-		rf.commitIndex, args.LeaderId, args.str(), len(args.Entries))
+		rf.commitIndex, rf.lastIncludedIndex, rf.lastIncludedTerm, args.LeaderId, args.str(), len(args.Entries))
 
 	myTerm := rf.currentTerm
 
@@ -303,15 +337,33 @@ func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *Requ
 
 	rf.resetElectionTimeout(rf.me)
 
-	if rf.lastLogIndex() < args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	if args.PrevLogIndex < rf.lastIncludedIndex {
+		reply.Term = rf.currentTerm
+		reply.Success = true
+		return
+	}
+
+	realLLIndex := rf.lastLogIndex() + rf.lastIncludedIndex
+	prevLogIndex := rf.realLogIndex(args.PrevLogIndex)
+	if prevLogIndex > rf.lastLogIndex() {
+		prevLogIndex = rf.lastLogIndex()
+	}
+	prevLogTerm := -1
+	if args.PrevLogIndex == rf.lastIncludedIndex {
+		prevLogTerm = rf.lastIncludedTerm
+	} else {
+		prevLogTerm = rf.log[prevLogIndex].Term
+	}
+	if realLLIndex < args.PrevLogIndex || prevLogTerm != args.PrevLogTerm {
 		reply.Term = rf.currentTerm
 		reply.Success = false
-		if rf.lastLogIndex() < args.PrevLogIndex {
-			reply.ConflictIndex = rf.lastLogIndex() + 1
+		if realLLIndex < args.PrevLogIndex {
+			reply.ConflictIndex = realLLIndex + 1
 		} else {
 			index := args.PrevLogIndex - 1
 			for {
-				if rf.log[args.PrevLogIndex].Term != rf.log[index].Term {
+				Dbg(dLog, "S%d index %d lastIncludedIndex %d", rf.me, index, rf.lastIncludedIndex)
+				if prevLogTerm != rf.log[rf.realLogIndex(index)].Term {
 					break
 				}
 				index--
@@ -327,11 +379,12 @@ func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *Requ
 		}
 
 		index := args.PrevLogIndex + 1
-		for i := 0; i < len(args.Entries) && index <= rf.lastLogIndex(); i++ {
-			if rf.log[index].Term != args.Entries[i].Term ||
-				(rf.log[index].Term == args.Entries[i].Term &&
-					!reflect.DeepEqual(rf.log[index].Command, args.Entries[i].Command)) { // compare interface ?
-				rf.log = rf.log[:index]
+		for i := 0; i < len(args.Entries) && index <= realLLIndex; i++ {
+			realIndex := rf.realLogIndex(index)
+			if rf.log[realIndex].Term != args.Entries[i].Term ||
+				(rf.log[realIndex].Term == args.Entries[i].Term &&
+					!reflect.DeepEqual(rf.log[realIndex].Command, args.Entries[i].Command)) { // compare interface ?
+				rf.log = rf.log[:realIndex]
 				break
 			}
 			index += 1
@@ -348,19 +401,20 @@ func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *Requ
 	}
 
 	if args.LeaderCommit > rf.commitIndex {
-		prevIndex := rf.commitIndex
-		if args.LeaderCommit < rf.lastLogIndex() {
+		prevCommitIndex := rf.commitIndex
+		if args.LeaderCommit < rf.lastLogIndex()+rf.lastIncludedIndex {
 			rf.commitIndex = args.LeaderCommit
 		} else {
-			rf.commitIndex = rf.lastLogIndex()
+			rf.commitIndex = rf.lastLogIndex() + rf.lastIncludedIndex
 		}
-		rf.notifyApply(prevIndex)
+		rf.notifyApply(prevCommitIndex)
 	}
 	/*for i := 0; i < len(rf.peers); i++ {
 		rf.matchIndex[i] = rf.lastLogIndex()
 		rf.nextIndex[i] = rf.lastLogIndex() + 1
 	}*/
 	reply.Success = true
+
 }
 
 func (rf *Raft) sendRequestAppendEntries(server int, args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply) bool {
@@ -401,7 +455,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	rf.persist()
 
-	index = rf.lastLogIndex()
+	index = rf.lastLogIndex() + rf.lastIncludedIndex
 	term = rf.currentTerm
 
 	return index, term, isLeader
@@ -430,6 +484,14 @@ func (rf *Raft) lastLogIndex() int {
 	return (len(rf.log) - 1)
 }
 
+func (rf *Raft) realLogIndex(index int) int {
+	if index >= rf.lastIncludedIndex {
+		return index - rf.lastIncludedIndex
+	}
+
+	return 0
+}
+
 func (rf *Raft) resetLeaderHeastbeatsTimeout(server int) {
 	//Dbg(dTimer, "S%d reset leader heartbeats timeout", server)
 	rf.resetElectionTimeout(server)
@@ -437,6 +499,7 @@ func (rf *Raft) resetLeaderHeastbeatsTimeout(server int) {
 
 func (rf *Raft) notifyApply(startCommitIndex int) {
 	go func() {
+		Dbg(dLog, "S%d notify apply", rf.me)
 		rf.applierCh <- startCommitIndex
 	}()
 }
@@ -447,18 +510,29 @@ func (rf *Raft) applier() {
 		case <-rf.applierCh:
 			rf.mu.Lock()
 			//defer rf.mu.Unlock()
-			Dbg(dPersist, "S%d apply start lastApplied %d CI %d", rf.me, rf.lastApplied, rf.commitIndex)
 
-			if rf.commitIndex > rf.lastApplied {
-				for index := rf.lastApplied; index <= rf.commitIndex; index++ {
-					rf.lastApplied = index
-					msg := ApplyMsg{true, rf.log[index].Command, index, false, nil, 0, 0}
-					rf.mu.Unlock()
-					rf.applyCh <- msg // may block, goroutine can not ensure sequence
-					rf.mu.Lock()
+			if rf.needApplySnapshot {
+				msg := ApplyMsg{false, 0, 0, true, rf.lastSnapshot, rf.lastIncludedTerm, rf.lastIncludedIndex}
+				Dbg(dSnap, "S%d apply message LII=%d LIT=%d", rf.me, rf.lastIncludedIndex, rf.lastIncludedTerm)
+				rf.needApplySnapshot = false
+				rf.lastApplied = rf.lastIncludedIndex
+				rf.mu.Unlock()
+				rf.applyCh <- msg // may block, goroutine can not ensure sequence
+				rf.mu.Lock()
+			} else {
+				Dbg(dPersist, "S%d apply start lastApplied %d CI %d", rf.me, rf.lastApplied, rf.commitIndex)
+				if rf.commitIndex > rf.lastApplied {
+					for index := rf.lastApplied + 1; index <= rf.commitIndex; index++ {
+						rf.lastApplied = index
+						Dbg(dPersist, "S%d apply message lastApplied=%d CI=%d", rf.me, rf.lastApplied, rf.commitIndex)
+						msg := ApplyMsg{true, rf.log[rf.realLogIndex(index)].Command, index, false, nil, 0, 0}
+						rf.mu.Unlock()
+						rf.applyCh <- msg // may block, goroutine can not ensure sequence
+						rf.mu.Lock()
+					}
+					rf.persist()
+					Dbg(dPersist, "S%d apply message lastApplied=%d CI=%d log %s", rf.me, rf.lastApplied, rf.commitIndex, logStr(rf.log))
 				}
-				rf.persist()
-				Dbg(dPersist, "S%d apply message lastApplied=%d CI=%d log %s", rf.me, rf.lastApplied, rf.commitIndex, logStr(rf.log))
 			}
 
 			rf.mu.Unlock()
@@ -491,22 +565,36 @@ func (rf *Raft) prepareAppendEntriesArgs(peer int, heartbeats bool) *RequestAppe
 
 	myLLIndex := rf.lastLogIndex()
 	//prevLogIndex := rf.matchIndex[peer]
+
 	prevLogIndex := 0
-	if rf.nextIndex[peer] > 1 {
+	prevLogTerm := -1
+	nextIndex := 1
+	if rf.nextIndex[peer] > rf.lastIncludedIndex {
 		prevLogIndex = rf.nextIndex[peer] - 1
+	} else {
+		if rf.nextIndex[peer] > myLLIndex {
+			rf.nextIndex[peer] = myLLIndex + 1
+		}
+		prevLogIndex = rf.nextIndex[peer] - 1 + rf.lastIncludedIndex
 	}
 
-	prevLogTerm := rf.log[prevLogIndex].Term
+	if prevLogIndex == rf.lastIncludedIndex {
+		prevLogTerm = rf.lastIncludedTerm
+	} else {
+		prevLogTerm = rf.log[rf.realLogIndex(prevLogIndex)].Term
+	}
+
+	nextIndex = rf.realLogIndex(prevLogIndex + 1)
 
 	args := &RequestAppendEntriesArgs{rf.currentTerm, rf.me, prevLogTerm, prevLogIndex, rf.commitIndex, nil}
 
-	if myLLIndex >= rf.nextIndex[peer] {
-		args.Entries = make([]LogEntry, len(rf.log)-rf.nextIndex[peer])
-		copy(args.Entries, rf.log[rf.nextIndex[peer]:])
+	if myLLIndex >= nextIndex {
+		args.Entries = make([]LogEntry, len(rf.log)-nextIndex)
+		copy(args.Entries, rf.log[nextIndex:])
 	}
-	Dbg(dLeader, "S%d send append entries to S%d [T=%d LLI=%d LLT=%d PLI=%d PLT=%d NI=%d MI=%d CI=%d HR=%t]",
+	Dbg(dLeader, "S%d send append entries to S%d [T=%d LLI=%d LLT=%d PLI=%d PLT=%d NI=%d MI=%d CI=%d LII=%d HR=%t]",
 		rf.me, peer, args.Term, myLLIndex, rf.log[myLLIndex].Term, args.PrevLogIndex, args.PrevLogTerm,
-		rf.nextIndex[peer], rf.matchIndex[peer], rf.commitIndex, heartbeats)
+		nextIndex, rf.matchIndex[peer], rf.commitIndex, rf.lastIncludedIndex, heartbeats)
 
 	return args
 }
@@ -522,10 +610,18 @@ func (rf *Raft) processAppendEntriesReply(peer int, args *RequestAppendEntriesAr
 	if reply.Success {
 
 		if args.Term == rf.currentTerm {
-			rf.matchIndex[peer] = args.PrevLogIndex + len(args.Entries)
-			rf.nextIndex[peer] = rf.matchIndex[peer] + 1
-			Dbg(dLeader, "S%d [T=%d MI=%d NI=%d CI=%d] receive append entries reply from S%d",
-				rf.me, args.Term, rf.matchIndex[peer], rf.nextIndex[peer], rf.commitIndex, peer)
+			matchIndex := args.PrevLogIndex + len(args.Entries)
+			if matchIndex > rf.matchIndex[peer] {
+				rf.matchIndex[peer] = matchIndex
+			}
+
+			nextIndex := matchIndex + 1
+			if nextIndex > rf.nextIndex[peer] {
+				rf.nextIndex[peer] = nextIndex
+			}
+
+			Dbg(dLeader, "S%d [T=%d MI=%d NI=%d CI=%d LII=%d] receive append entries reply from S%d",
+				rf.me, args.Term, rf.matchIndex[peer], rf.nextIndex[peer], rf.commitIndex, rf.lastIncludedIndex, peer)
 		}
 
 		count := 1
@@ -539,7 +635,7 @@ func (rf *Raft) processAppendEntriesReply(peer int, args *RequestAppendEntriesAr
 			}
 		}
 
-		if count > len(rf.peers)/2 && rf.log[minIndex].Term == rf.currentTerm {
+		if count > len(rf.peers)/2 && rf.log[rf.realLogIndex(minIndex)].Term == rf.currentTerm {
 			rf.commitIndex = minIndex
 
 			Dbg(dLeader, "S%d receive append entries reply from S%d, majority [T=%d MI=%d CI=%d]",
@@ -558,6 +654,10 @@ func (rf *Raft) processAppendEntriesReply(peer int, args *RequestAppendEntriesAr
 			//rf.nextIndex[peer] -= 1
 			//rf.matchIndex[peer] -= 1
 		}
+	}
+
+	if rf.state == LEADER && rf.nextIndex[peer] <= rf.lastIncludedIndex {
+		//rf.sendInstallSnapshot(peer)
 	}
 }
 
@@ -646,6 +746,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.nextIndex = make([]int, len(peers))
 	rf.matchIndex = make([]int, len(peers))
+
+	rf.lastIncludedIndex = 0
+	rf.lastIncludedTerm = -1
+	rf.needApplySnapshot = false
 
 	rand.New(rand.NewSource(time.Now().UnixNano()))
 	rf.setElectionTimeout()
