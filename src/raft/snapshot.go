@@ -1,5 +1,7 @@
 package raft
 
+import "fmt"
+
 type InstallSnapshotArgs struct {
 	Term              int    // leader’s term
 	LeaderId          int    // so follower can redirect clients
@@ -8,6 +10,11 @@ type InstallSnapshotArgs struct {
 	Offset            int    // byte offset where chunk is positioned in the snapshot file
 	Data              []byte // raw bytes of the snapshot chunk, starting at offset
 	Done              bool   // true if this is the last chunk
+}
+
+func (args *InstallSnapshotArgs) str() string {
+	return fmt.Sprintf("[T=%d LII=%d LIT=%d DataLen=%d]",
+		args.Term, args.LastIncludedIndex, args.LastIncludedTerm, len(args.Data))
 }
 
 type InstallSnapshotReply struct {
@@ -36,24 +43,31 @@ func (rf *Raft) RequestInstallSnapshot(args *InstallSnapshotArgs, reply *Install
 
 	if args.Offset == 0 {
 		if rf.lastIncludedIndex < args.LastIncludedIndex {
-			Dbg(dSnap, "S%d snapshot last include index %d term %d, log %s", rf.me, rf.lastIncludedIndex, rf.lastIncludedTerm, logStr(rf.log))
+			Dbg(dSnap, "S%d [LII=%d LIT=%d] receive snapshot from S%d %s, log %s",
+				rf.me, rf.lastIncludedIndex, rf.lastIncludedTerm, args.LeaderId, args.str(), logStr(rf.log))
 			var log []LogEntry
 			log = append(log, rf.log[0])
-			trimIndex := rf.realLogIndex(args.LastIncludedIndex + 1)
-			if trimIndex <= rf.lastLogIndex() {
+			trimIndex := rf.logArrIndex(args.LastIncludedIndex + 1)
+			if trimIndex < len(rf.log) {
 				log = append(log, rf.log[trimIndex:]...)
 			}
 			rf.log = log
-			Dbg(dSnap, "S%d snapshot last include index %d term %d, trim log %s", rf.me, rf.lastIncludedIndex, rf.lastIncludedTerm, logStr(rf.log))
+			Dbg(dSnap, "S%d snapshot trim log %s", rf.me, logStr(rf.log))
 
-			rf.lastSnapshot = append(rf.lastSnapshot[:0], args.Data...)
+			rf.lastSnapshot = make([]byte, len(args.Data))
+			copy(rf.lastSnapshot, args.Data)
 			rf.lastIncludedIndex = args.LastIncludedIndex
 			rf.lastIncludedTerm = args.LastIncludedTerm
+			rf.lastApplied = rf.lastIncludedIndex
+			if rf.commitIndex < rf.lastIncludedIndex {
+				rf.commitIndex = rf.lastIncludedIndex
+			}
 			rf.needApplySnapshot = true
 
 			rf.persist()
-			rf.persister.SaveStateAndSnapshot(rf.persister.ReadRaftState(), args.Data)
-			rf.notifyApply(rf.lastIncludedIndex)
+			raftlog := rf.persister.ReadRaftState()
+			rf.persister.SaveStateAndSnapshot(raftlog, args.Data)
+			rf.notifyApply()
 		} else {
 			if rf.lastIncludedTerm == args.LastIncludedTerm {
 

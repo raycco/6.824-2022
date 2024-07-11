@@ -42,12 +42,6 @@ func (reqVoteReply *RequestVoteReply) str() string {
 	return fmt.Sprintf("[T=%d GRANT=%t]", reqVoteReply.Term, reqVoteReply.VoteGranted)
 }
 
-type VoteReplyMsg struct {
-	ok     bool
-	server int
-	reply  RequestVoteReply
-}
-
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
@@ -55,26 +49,27 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	myTerm := rf.currentTerm
-	myLLIndex := rf.lastLogIndex()
+	nTerm := rf.currentTerm
+	nLLIndex := rf.lastLogIndex()
+	nLLTerm := rf.logEntryTerm(nLLIndex)
 
-	Dbg(dVote, "S%d [T=%d VF=%d LLI=%d LLT=%d ST=%d CI=%d] receive vote req from S%d %s",
-		rf.me, rf.currentTerm, rf.votedFor, rf.lastLogIndex(), rf.log[myLLIndex].Term,
+	Dbg(dVote, "S%d [T=%d VF=%d LLI=%d LLT=%d ST=%d CI=%d] receive vote request from S%d %s",
+		rf.me, rf.currentTerm, rf.votedFor, nLLIndex, nLLTerm,
 		rf.state, rf.commitIndex, args.CandidateId, args.str())
 
-	reply.Term = myTerm
+	reply.Term = nTerm
 
-	if args.Term > myTerm {
+	if args.Term > nTerm {
 		rf.convertToFollower(args.Term)
 	}
 
-	if args.Term <= myTerm || (rf.votedFor != -1 && args.CandidateId != rf.votedFor) {
+	if args.Term <= nTerm || (rf.votedFor != -1 && args.CandidateId != rf.votedFor) {
 		reply.VoteGranted = false
 		return
 	}
 
-	if args.LastLogTerm < rf.log[myLLIndex].Term ||
-		(args.LastLogTerm == rf.log[myLLIndex].Term && args.LastLogIndex < myLLIndex) {
+	if args.LastLogTerm < nLLTerm ||
+		(args.LastLogTerm == nLLTerm && args.LastLogIndex < nLLIndex) {
 		reply.VoteGranted = false
 		return
 	}
@@ -149,8 +144,13 @@ func (rf *Raft) startElection() {
 	rf.convertToCandidate()
 	voteCount := 1
 
-	myLLIndex := rf.lastLogIndex()
-	args := &RequestVoteArgs{rf.currentTerm, rf.me, myLLIndex, rf.log[myLLIndex].Term}
+	nLLIndex := rf.lastLogIndex()
+	nLLTerm := rf.logEntryTerm(nLLIndex)
+	/*myLLTerm := rf.log[myLLIndex].Term
+	if rf.lastIncludedIndex == rf.lastLogIndex() {
+		myLLTerm = rf.lastIncludedTerm
+	}*/
+	args := &RequestVoteArgs{rf.currentTerm, rf.me, nLLIndex, nLLTerm}
 	for peer := 0; peer < len(rf.peers); peer++ {
 		if peer != rf.me {
 			go func(server int, args *RequestVoteArgs) {
