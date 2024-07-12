@@ -14,15 +14,20 @@ type RequestAppendEntriesArgs struct {
 	Entries      []LogEntry // log entries to store (empty for heartbeat; may send more than one for efficiency)
 }
 
-func (reqAppendArgs *RequestAppendEntriesArgs) str() string {
-	return fmt.Sprintf("[T=%d PLI=%d PLT=%d CI=%d]",
-		reqAppendArgs.Term, reqAppendArgs.PrevLogIndex, reqAppendArgs.PrevLogTerm, reqAppendArgs.LeaderCommit)
+func (args *RequestAppendEntriesArgs) str() string {
+	return fmt.Sprintf("args:[T=%d PLI=%d PLT=%d CI=%d Len=%d]",
+		args.Term, args.PrevLogIndex, args.PrevLogTerm, args.LeaderCommit, len(args.Entries))
 }
 
 type RequestAppendEntriesReply struct {
 	Term          int  // currentTerm, for leader to update itself
 	Success       bool // true if follower contained entry matching prevLogIndex and prevLogTerm
 	ConflictIndex int  // the protocol can be optimized to reduce the number of rejected AppendEntries RPCs
+}
+
+func (reply *RequestAppendEntriesReply) str() string {
+	return fmt.Sprintf("reply:[T=%d CONI=%d SUCC=%t]",
+		reply.Term, reply.ConflictIndex, reply.Success)
 }
 
 func (rf *Raft) sendRequestAppendEntries(server int, args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply) bool {
@@ -70,21 +75,21 @@ func (rf *Raft) searchConflictIndex1(prevLogIndex int) int {
 }
 
 func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply) {
-	//LogPrint(INFO, dLog, "S%d RequestAppendEntries from S%d T%d", rf.me, args.LeaderId, args.Term)
+
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	LogPrint(INFO, dLog, "S%d [T=%d LLI=%d LLT=%d ST=%d CI=%d LII=%d LIT=%d] receive log entries from S%d %s HR=%d",
+	LogPrint(INFO, dLog, "S%d [T=%d LLI=%d LLT=%d ST=%d CI=%d LII=%d LIT=%d] get append entries req from S%d %s HR=%d",
 		rf.me, rf.currentTerm, rf.lastLogIndex(), rf.log[rf.logArrIndex(rf.lastLogIndex())].Term, rf.state,
 		rf.commitIndex, rf.lastIncludedIndex, rf.lastIncludedTerm, args.LeaderId, args.str(), len(args.Entries))
 
-	myTerm := rf.currentTerm
+	nTerm := rf.currentTerm
 
-	if args.Term > myTerm { // leader term > my term => follower
+	if args.Term > nTerm { // leader term > my term => follower
 		rf.convertToFollower(args.Term)
 	}
 
-	if args.Term < myTerm { // leader term < my term, reject
+	if args.Term < nTerm { // leader term < my term, reject
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		return // if the term in the AppendEntries arguments is outdated, you should not reset your timer
@@ -99,11 +104,6 @@ func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *Requ
 	}
 
 	nLLIndex := rf.lastLogIndex()
-	/*prevLogIndex := args.PrevLogIndex
-	if args.PrevLogIndex > nLLIndex {
-		prevLogIndex = nLLIndex
-	}*/
-	//prevLogTerm := rf.logEntryTerm(args.PrevLogIndex)
 	if nLLIndex < args.PrevLogIndex || rf.logEntryTerm(args.PrevLogIndex) != args.PrevLogTerm {
 		reply.Term = rf.currentTerm
 		reply.Success = false
@@ -154,12 +154,8 @@ func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *Requ
 		}
 		rf.notifyApply()
 	}
-	/*for i := 0; i < len(rf.peers); i++ {
-		rf.matchIndex[i] = rf.lastLogIndex()
-		rf.nextIndex[i] = rf.lastLogIndex() + 1
-	}*/
+	reply.Term = rf.currentTerm
 	reply.Success = true
-
 }
 
 func (rf *Raft) prepareAppendEntriesArgs(peer int, heartbeats bool) *RequestAppendEntriesArgs {
@@ -185,9 +181,9 @@ func (rf *Raft) prepareAppendEntriesArgs(peer int, heartbeats bool) *RequestAppe
 		args.Entries = make([]LogEntry, len(rf.log)-nextIndex)
 		copy(args.Entries, rf.log[nextIndex:])
 	}
-	LogPrint(INFO, dLeader, "S%d send log entries to S%d [T=%d LLI=%d LLT=%d PLI=%d PLT=%d NI=%d MI=%d CI=%d LII=%d LIT=%d HR=%t]",
-		rf.me, peer, args.Term, nLLIndex, rf.log[nLLIndex].Term, args.PrevLogIndex, args.PrevLogTerm,
-		rf.nextIndex[peer], rf.matchIndex[peer], rf.commitIndex, rf.lastIncludedIndex, rf.lastIncludedTerm, heartbeats)
+
+	LogPrint(INFO, dLeader, "S%d put append entries to S%d %s [LLI=%d LLT=%d NI=%d MI=%d LII=%d LIT=%d HR=%t]",
+		rf.me, peer, args.str(), rf.lastLogIndex(), rf.log[nLLIndex].Term, rf.nextIndex[peer], rf.matchIndex[peer], rf.lastIncludedIndex, rf.lastIncludedTerm, heartbeats)
 
 	return args
 }
@@ -195,6 +191,8 @@ func (rf *Raft) prepareAppendEntriesArgs(peer int, heartbeats bool) *RequestAppe
 func (rf *Raft) processAppendEntriesReply(peer int, args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
+	LogPrint(INFO, dLeader, "S%d T=%d %s get append entries res from S%d %s", rf.me, rf.currentTerm, args.str(), peer, reply.str())
 
 	if reply.Term > rf.currentTerm {
 		rf.convertToFollower(reply.Term)
@@ -213,8 +211,9 @@ func (rf *Raft) processAppendEntriesReply(peer int, args *RequestAppendEntriesAr
 				rf.nextIndex[peer] = nextIndex
 			}
 
-			LogPrint(INFO, dLeader, "S%d [T=%d MI=%d NI=%d CI=%d LII=%d] receive log entries reply from S%d",
-				rf.me, args.Term, rf.matchIndex[peer], rf.nextIndex[peer], rf.commitIndex, rf.lastIncludedIndex, peer)
+			LogPrint(INFO, dLeader, "S%d [T=%d MI=%d NI=%d CI=%d LII=%d LIT=%d] get append entries res from S%d",
+				rf.me, args.Term, rf.matchIndex[peer], rf.nextIndex[peer], rf.commitIndex,
+				rf.lastIncludedIndex, rf.lastIncludedTerm, peer)
 		}
 
 		count := 1
@@ -231,16 +230,16 @@ func (rf *Raft) processAppendEntriesReply(peer int, args *RequestAppendEntriesAr
 		if count > len(rf.peers)/2 && rf.log[rf.logArrIndex(minIndex)].Term == rf.currentTerm {
 			rf.commitIndex = minIndex
 
-			LogPrint(INFO, dLeader, "S%d receive log entries reply from S%d, majority [T=%d MI=%d CI=%d]",
-				rf.me, peer, args.Term, rf.matchIndex[rf.me], rf.commitIndex)
+			LogPrint(INFO, dLeader, "S%d get append entries res from S%d, majority [T=%d CI=%d]",
+				rf.me, peer, args.Term, rf.commitIndex)
 
 			rf.notifyApply()
 			//rf.matchIndex[rf.me] = rf.commitIndex
 			//rf.nextIndex[rf.me] = rf.matchIndex[rf.me] + 1
 		}
 	} else {
-		LogPrint(INFO, dLeader, "S%d [T=%d ST=%d ArgsT=%d] receive log entries reply from S%d [T=%d ConflictIndex=%d]",
-			rf.me, rf.currentTerm, rf.state, args.Term, peer, reply.Term, reply.ConflictIndex)
+		LogPrint(INFO, dLeader, "S%d [T=%d ST=%d] args:[T=%d] get append entries res from S%d",
+			rf.me, rf.currentTerm, rf.state, args.Term, peer)
 		if args.Term == rf.currentTerm &&
 			reply.ConflictIndex < rf.nextIndex[peer] { // reponse reorder
 			rf.nextIndex[peer] = reply.ConflictIndex

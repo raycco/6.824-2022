@@ -25,9 +25,9 @@ type RequestVoteArgs struct {
 	LastLogTerm  int // term of candidate’s last log entry
 }
 
-func (reqVoteArgs *RequestVoteArgs) str() string {
-	return fmt.Sprintf("[T=%d LLI=%d LLT=%d]",
-		reqVoteArgs.Term, reqVoteArgs.LastLogIndex, reqVoteArgs.LastLogTerm)
+func (args *RequestVoteArgs) str() string {
+	return fmt.Sprintf("args:[T=%d LLI=%d LLT=%d]",
+		args.Term, args.LastLogIndex, args.LastLogTerm)
 }
 
 // example RequestVote RPC reply structure.
@@ -38,14 +38,13 @@ type RequestVoteReply struct {
 	VoteGranted bool // true means candidate received vote
 }
 
-func (reqVoteReply *RequestVoteReply) str() string {
-	return fmt.Sprintf("[T=%d GRANT=%t]", reqVoteReply.Term, reqVoteReply.VoteGranted)
+func (reply *RequestVoteReply) str() string {
+	return fmt.Sprintf("reply:[T=%d GRANT=%t]", reply.Term, reply.VoteGranted)
 }
 
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	//LogPrint(INFO, dVote, "S%d RequestVote S%d T%d", rf.me, args.CandidateId, args.Term)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -53,7 +52,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	nLLIndex := rf.lastLogIndex()
 	nLLTerm := rf.logEntryTerm(nLLIndex)
 
-	LogPrint(INFO, dVote, "S%d [T=%d VF=%d LLI=%d LLT=%d ST=%d CI=%d] receive vote request from S%d %s",
+	LogPrint(INFO, dVote, "S%d [T=%d VF=%d LLI=%d LLT=%d ST=%d CI=%d] get vote req from S%d %s",
 		rf.me, rf.currentTerm, rf.votedFor, nLLIndex, nLLTerm,
 		rf.state, rf.commitIndex, args.CandidateId, args.str())
 
@@ -68,8 +67,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
-	if args.LastLogTerm < nLLTerm ||
-		(args.LastLogTerm == nLLTerm && args.LastLogIndex < nLLIndex) {
+	if args.LastLogTerm < nLLTerm || (args.LastLogTerm == nLLTerm && args.LastLogIndex < nLLIndex) {
 		reply.VoteGranted = false
 		return
 	}
@@ -130,7 +128,7 @@ func (rf *Raft) convertToLeader() {
 	// other algorithms must send redundant log entries to renumber them before they can be committed
 	// rf.log = append(rf.log, LogEntry{rf.currentTerm, nil}) // no-op
 
-	LogPrint(INFO, dLeader, "S%d victory T%d", rf.me, rf.currentTerm)
+	LogPrint(INFO, dLeader, "S%d victory at T%d, become leader", rf.me, rf.currentTerm)
 	for peer := 0; peer < len(rf.peers); peer++ {
 		rf.nextIndex[peer] = rf.lastLogIndex() + 1
 		rf.matchIndex[peer] = rf.commitIndex
@@ -155,15 +153,14 @@ func (rf *Raft) startElection() {
 		if peer != rf.me {
 			go func(server int, args *RequestVoteArgs) {
 				var reply RequestVoteReply
-				LogPrint(INFO, dVote, "S%d %s send vote request to S%d", rf.me, args.str(), server)
+				LogPrint(INFO, dVote, "S%d %s put vote req to S%d", rf.me, args.str(), server)
 				ok := rf.sendRequestVote(server, args, &reply)
 
-				//rf.voteCh <- VoteReplyMsg{ok, server, reply}
 				if ok {
 					rf.mu.Lock()
 					defer rf.mu.Unlock()
 
-					LogPrint(INFO, dVote, "S%d [T=%d CNT=%d ArgsT=%d] receive vote reply from S%d %s\n",
+					LogPrint(INFO, dVote, "S%d [T=%d CNT=%d] args:[T=%d] get vote res from S%d %s\n",
 						rf.me, rf.currentTerm, voteCount, args.Term, server, reply.str())
 
 					if reply.Term > rf.currentTerm {
@@ -236,7 +233,7 @@ func (rf *Raft) doElection() {
 
 	case <-time.After(rf.electionTimeout):
 		rf.mu.Lock()
-		LogPrint(INFO, dTimer, "S%d timeout, next election", rf.me)
+		LogPrint(INFO, dTimer, "S%d timeout, start next election", rf.me)
 		if rf.lastElectionTimeout == rf.electionTimeout {
 			rf.startElection()
 		} else {

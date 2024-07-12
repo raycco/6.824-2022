@@ -160,7 +160,11 @@ func (rf *Raft) persist() {
 	}*/
 
 	data := byteBuffer.Bytes()
-	rf.persister.SaveRaftState(data)
+	if len(rf.lastSnapshot) > 0 {
+		rf.persister.SaveStateAndSnapshot(data, rf.lastSnapshot)
+	} else {
+		rf.persister.SaveRaftState(data)
+	}
 }
 
 // restore previously persisted state.
@@ -207,7 +211,7 @@ func (rf *Raft) readPersist(data []byte) {
 	rf.lastApplied = rf.lastIncludedIndex
 	rf.notifyApply()
 
-	LogPrint(INFO, dPersist, "S%d ReadRaftState lastApplied=%d CI=%d LII=%d LIT=%d log %s",
+	LogPrint(INFO, dPersist, "S%d read raft state lastApplied=%d CI=%d LII=%d LIT=%d log %s",
 		rf.me, rf.lastApplied, rf.commitIndex, rf.lastIncludedIndex, rf.lastIncludedTerm, logStr(rf.log))
 }
 
@@ -229,9 +233,19 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	rf.lastIncludedTerm = rf.log[rf.logArrIndex(index)].Term
+	if len(snapshot) < 1 {
+		LogPrint(ERROR, dSnap, "S%d snapshot byte buffer is nil", rf.me)
+		return
+	}
+
+	if index > rf.commitIndex {
+		LogPrint(ERROR, dSnap, "S%d snapshot index error index=%d CI=%d", rf.me, index, rf.commitIndex)
+		return
+	}
 
 	LogPrint(INFO, dSnap, "S%d snapshot LII=%d LIT=%d, log %s", rf.me, rf.lastIncludedIndex, rf.lastIncludedTerm, logStr(rf.log))
+
+	rf.lastIncludedTerm = rf.log[rf.logArrIndex(index)].Term
 
 	var log []LogEntry
 	log = append(log, rf.log[0])
@@ -239,21 +253,19 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	if trimIndex < len(rf.log) {
 		log = append(log, rf.log[trimIndex:]...)
 	}
-
 	rf.log = log
 	//rf.log = append(rf.log[:0], rf.log[index+1:]...)
 
-	rf.lastIncludedIndex = index
+	rf.lastIncludedIndex = index // after trim log
 	rf.lastSnapshot = make([]byte, len(snapshot))
 	copy(rf.lastSnapshot, snapshot)
+
+	rf.persist()
+
 	rf.needApplySnapshot = true
 	rf.notifyApply()
 
-	LogPrint(INFO, dSnap, "S%d snapshot LII=%d LIT=%d, trim log %s", rf.me, rf.lastIncludedIndex, rf.lastIncludedTerm, logStr(rf.log))
-
-	rf.persist()
-	raftlog := rf.persister.ReadRaftState()
-	rf.persister.SaveStateAndSnapshot(raftlog, snapshot)
+	LogPrint(INFO, dSnap, "S%d snapshot LII=%d LIT=%d, trimed log %s", rf.me, rf.lastIncludedIndex, rf.lastIncludedTerm, logStr(rf.log))
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -280,8 +292,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if rf.state == LEADER {
 		isLeader = true
 		rf.log = append(rf.log, LogEntry{rf.currentTerm, command})
+		nLLIndex := rf.lastLogIndex()
 		LogPrint(INFO, dLog, "S%d Start T=%d ST=%d CI=%d LLI=%d %s",
-			rf.me, rf.currentTerm, rf.state, rf.commitIndex, rf.lastLogIndex(), rf.log[rf.logArrIndex(rf.lastLogIndex())].str())
+			rf.me, rf.currentTerm, rf.state, rf.commitIndex, nLLIndex, rf.log[rf.logArrIndex(nLLIndex)].str())
 		rf.sendAppendEntries(false)
 	} else {
 		isLeader = false
@@ -327,18 +340,8 @@ func (rf *Raft) applier() {
 		select {
 		case <-rf.applierCh:
 			rf.mu.Lock()
-			//defer rf.mu.Unlock()
 
-			/*if rf.needApplySnapshot {
-				msg := ApplyMsg{false, 0, 0, true, rf.lastSnapshot, rf.lastIncludedTerm, rf.lastIncludedIndex}
-				Dbg(dSnap, "S%d apply message LII=%d LIT=%d", rf.me, rf.lastIncludedIndex, rf.lastIncludedTerm)
-				rf.needApplySnapshot = false
-				rf.lastApplied = rf.lastIncludedIndex
-				rf.mu.Unlock()
-				rf.applyCh <- msg // may block, goroutine can not ensure sequence
-				rf.mu.Lock()
-			} else {*/
-			LogPrint(INFO, dPersist, "S%d apply start lastApplied=%d CI=%d", rf.me, rf.lastApplied, rf.commitIndex)
+			LogPrint(INFO, dClient, "S%d apply start lastApplied=%d CI=%d", rf.me, rf.lastApplied, rf.commitIndex)
 			if rf.commitIndex > rf.lastApplied {
 				for index := rf.lastApplied + 1; index <= rf.commitIndex; index++ {
 					var msg ApplyMsg
@@ -346,11 +349,13 @@ func (rf *Raft) applier() {
 						rf.needApplySnapshot = false
 						index = rf.lastIncludedIndex
 						msg = ApplyMsg{false, 0, 0, true, rf.lastSnapshot, rf.lastIncludedTerm, rf.lastIncludedIndex}
-						LogPrint(INFO, dSnap, "S%d apply message LII=%d LIT=%d", rf.me, rf.lastIncludedIndex, rf.lastIncludedTerm)
+						LogPrint(INFO, dClient, "S%d apply snapshot lastApplied=%d CI=%d LII=%d LIT=%d",
+							rf.me, rf.lastApplied, rf.commitIndex, rf.lastIncludedIndex, rf.lastIncludedTerm)
 					} else {
 						msg = ApplyMsg{true, rf.log[rf.logArrIndex(index)].Command, index, false, nil, 0, 0}
 						rf.lastApplied = index
-						LogPrint(DEBUG, dPersist, "S%d apply message lastApplied=%d CI=%d", rf.me, rf.lastApplied, rf.commitIndex)
+						LogPrint(DEBUG, dClient, "S%d apply lastApplied=%d CI=%d LII=%d LIT=%d",
+							rf.me, rf.lastApplied, rf.commitIndex, rf.lastIncludedIndex, rf.lastIncludedTerm)
 					}
 
 					rf.mu.Unlock()
@@ -358,75 +363,18 @@ func (rf *Raft) applier() {
 					rf.mu.Lock()
 				}
 				rf.persist()
-				LogPrint(INFO, dPersist, "S%d apply message lastApplied=%d CI=%d log %s", rf.me, rf.lastApplied, rf.commitIndex, logStr(rf.log))
-			}
-			//}
-
-			rf.mu.Unlock()
-		case <-time.After(10 * time.Millisecond):
-			//Dbg(dPersist, "S%d apply start index timeout", rf.me)
-			continue
-		}
-		/*select {
-		case <-rf.applierCh:
-			rf.mu.Lock()
-			//defer rf.mu.Unlock()
-
-			if rf.needApplySnapshot {
-				msg := ApplyMsg{false, 0, 0, true, rf.lastSnapshot, rf.lastIncludedTerm, rf.lastIncludedIndex}
-				Dbg(dSnap, "S%d apply message LII=%d LIT=%d", rf.me, rf.lastIncludedIndex, rf.lastIncludedTerm)
-				rf.needApplySnapshot = false
-				rf.lastApplied = rf.lastIncludedIndex
-				rf.mu.Unlock()
-				rf.applyCh <- msg // may block, goroutine can not ensure sequence
-				rf.mu.Lock()
-			} else {
-				Dbg(dPersist, "S%d apply start lastApplied=%d CI=%d", rf.me, rf.lastApplied, rf.commitIndex)
-				if rf.commitIndex > rf.lastApplied {
-					for index := rf.lastApplied + 1; index <= rf.commitIndex; index++ {
-						msg := ApplyMsg{true, rf.log[rf.logArrIndex(index)].Command, index, false, nil, 0, 0}
-						rf.mu.Unlock()
-						rf.applyCh <- msg // may block, goroutine can not ensure sequence
-						rf.mu.Lock()
-						if rf.needApplySnapshot {
-							break
-						}
-						rf.lastApplied = index
-						Dbg(dPersist, "S%d apply message lastApplied=%d CI=%d", rf.me, rf.lastApplied, rf.commitIndex)
-					}
-					rf.persist()
-					Dbg(dPersist, "S%d apply message lastApplied=%d CI=%d log %s", rf.me, rf.lastApplied, rf.commitIndex, logStr(rf.log))
-				}
-			}
-
-			rf.mu.Unlock()
-		case <-time.After(20 * time.Millisecond):
-			//Dbg(dPersist, "S%d apply start index timeout", rf.me)
-			continue
-		}*/
-
-		/*select {
-		case startCommitIndex := <-rf.applierCh:
-			Dbg(dPersist, "S%d apply start index %d", rf.me, startCommitIndex)
-			rf.mu.Lock()
-			//defer rf.mu.Unlock()
-			for index := startCommitIndex; index <= rf.commitIndex; index++ {
-				if index > rf.lastApplied {
-					rf.lastApplied = index
-					rf.persist()
-					rf.applyCh <- ApplyMsg{true, rf.log[index].Command, index, false, nil, 0, 0}
-				}
+				LogPrint(INFO, dClient, "S%d apply end lastApplied=%d CI=%d log %s", rf.me, rf.lastApplied, rf.commitIndex, logStr(rf.log))
 			}
 			rf.mu.Unlock()
+
 		case <-time.After(50 * time.Millisecond):
-			//Dbg(dPersist, "S%d apply start index timeout", rf.me)
-			continue
-		}*/
+			//LogPrint(DEBUG, dPersist, "S%d applier timeout", rf.me)
+		}
 	}
 }
 
 func (rf *Raft) resetLeaderHeastbeatsTimeout(server int) {
-	//Dbg(dTimer, "S%d reset leader heartbeats timeout", server)
+	//LogPrint(DEBUG, dTimer, "S%d reset leader heartbeats timeout", server)
 	rf.resetElectionTimeout(server)
 }
 
@@ -440,7 +388,7 @@ func (rf *Raft) sendHeartbeats() {
 // The ticker go routine starts a new election if this peer hasn't received
 // heartsbeats recently.
 func (rf *Raft) ticker() {
-	for rf.killed() == false {
+	for !rf.killed() {
 
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using

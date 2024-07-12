@@ -13,7 +13,7 @@ type InstallSnapshotArgs struct {
 }
 
 func (args *InstallSnapshotArgs) str() string {
-	return fmt.Sprintf("[T=%d LII=%d LIT=%d DataLen=%d]",
+	return fmt.Sprintf("args:[T=%d LII=%d LIT=%d DataLen=%d]",
 		args.Term, args.LastIncludedIndex, args.LastIncludedTerm, len(args.Data))
 }
 
@@ -43,7 +43,7 @@ func (rf *Raft) RequestInstallSnapshot(args *InstallSnapshotArgs, reply *Install
 
 	if args.Offset == 0 {
 		if rf.lastIncludedIndex < args.LastIncludedIndex {
-			LogPrint(INFO, dSnap, "S%d [LII=%d LIT=%d] receive snapshot from S%d %s, log %s",
+			LogPrint(INFO, dSnap, "S%d [LII=%d LIT=%d] get snapshot req from S%d %s, log %s",
 				rf.me, rf.lastIncludedIndex, rf.lastIncludedTerm, args.LeaderId, args.str(), logStr(rf.log))
 			var log []LogEntry
 			log = append(log, rf.log[0])
@@ -63,12 +63,10 @@ func (rf *Raft) RequestInstallSnapshot(args *InstallSnapshotArgs, reply *Install
 			}
 			rf.needApplySnapshot = true
 
-			LogPrint(INFO, dSnap, "S%d [LII=%d LIT=%d] receive snapshot from S%d %s, trim log %s",
+			LogPrint(INFO, dSnap, "S%d [LII=%d LIT=%d] get snapshot req from S%d %s, trimed log %s",
 				rf.me, rf.lastIncludedIndex, rf.lastIncludedTerm, args.LeaderId, args.str(), logStr(rf.log))
 
 			rf.persist()
-			raftlog := rf.persister.ReadRaftState()
-			rf.persister.SaveStateAndSnapshot(raftlog, args.Data)
 			rf.notifyApply()
 		} else {
 			if rf.lastIncludedTerm == args.LastIncludedTerm {
@@ -91,7 +89,10 @@ func (rf *Raft) sendInstallSnapshot(peer int) {
 		args.Done = true
 
 		go func(peer int, args *InstallSnapshotArgs) {
+			LogPrint(INFO, dSnap, "S%d %s put snapshot req to S%d", rf.me, args.str(), peer)
+
 			var reply InstallSnapshotReply
+
 			ok := rf.sendRequestInstallSnapshot(peer, args, &reply)
 
 			if ok {
