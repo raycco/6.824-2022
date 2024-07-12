@@ -2,13 +2,15 @@ package raft
 
 import "fmt"
 
+const LogStartIndex = 1
+
 type LogEntry struct {
 	Term    int
 	Command interface{}
 }
 
 func (logEntry *LogEntry) str() string {
-	return fmt.Sprintf("{T:%d C:%v}", logEntry.Term, logEntry.Command)
+	return fmt.Sprintf("{%d:%v}", logEntry.Term, logEntry.Command)
 }
 
 func logStr(log []LogEntry) string {
@@ -42,7 +44,7 @@ func (rf *Raft) logArrIndex(index int) int {
 func (rf *Raft) logEntryTerm(index int) int {
 	arrIndex := rf.logArrIndex(index)
 
-	if arrIndex == 0 {
+	if arrIndex == 0 && index != 0 { // lastIncludedIndex == 0
 		return rf.lastIncludedTerm
 	}
 

@@ -87,10 +87,6 @@ type Raft struct {
 	lastIncludedTerm  int
 	lastSnapshot      []byte
 	needApplySnapshot bool
-
-	newSnapshot      []byte
-	newIncludedIndex int
-	newIncludedTerm  int
 }
 
 // return currentTerm and whether this server
@@ -130,7 +126,7 @@ func (rf *Raft) persist() {
 		encoder.Encode(rf.lastIncludedIndex) != nil ||
 		encoder.Encode(rf.lastIncludedTerm) != nil ||
 		encoder.Encode(rf.log) != nil {
-		Dbg(dPersist, "S%d encode error", rf.me)
+		LogPrint(ERROR, dPersist, "S%d encode error", rf.me)
 	}
 	/*var err error
 	err = encoder.Encode(rf.currentTerm)
@@ -197,7 +193,7 @@ func (rf *Raft) readPersist(data []byte) {
 		decoder.Decode(&rf.lastIncludedIndex) != nil ||
 		decoder.Decode(&rf.lastIncludedTerm) != nil ||
 		decoder.Decode(&rf.log) != nil {
-		Dbg(dPersist, "S%d decode error", rf.me)
+		LogPrint(ERROR, dPersist, "S%d decode error", rf.me)
 	}
 
 	rf.lastSnapshot = rf.persister.ReadSnapshot()
@@ -211,7 +207,7 @@ func (rf *Raft) readPersist(data []byte) {
 	rf.lastApplied = rf.lastIncludedIndex
 	rf.notifyApply()
 
-	Dbg(dPersist, "S%d ReadRaftState lastApplied=%d CI=%d LII=%d LIT=%d log %s",
+	LogPrint(INFO, dPersist, "S%d ReadRaftState lastApplied=%d CI=%d LII=%d LIT=%d log %s",
 		rf.me, rf.lastApplied, rf.commitIndex, rf.lastIncludedIndex, rf.lastIncludedTerm, logStr(rf.log))
 }
 
@@ -235,7 +231,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 	rf.lastIncludedTerm = rf.log[rf.logArrIndex(index)].Term
 
-	Dbg(dSnap, "S%d snapshot LII=%d LIT=%d, log %s", rf.me, rf.lastIncludedIndex, rf.lastIncludedTerm, logStr(rf.log))
+	LogPrint(INFO, dSnap, "S%d snapshot LII=%d LIT=%d, log %s", rf.me, rf.lastIncludedIndex, rf.lastIncludedTerm, logStr(rf.log))
 
 	var log []LogEntry
 	log = append(log, rf.log[0])
@@ -247,13 +243,13 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.log = log
 	//rf.log = append(rf.log[:0], rf.log[index+1:]...)
 
-	Dbg(dSnap, "S%d snapshot LII=%d LIT=%d, trim log %s", rf.me, rf.lastIncludedIndex, rf.lastIncludedTerm, logStr(rf.log))
-
 	rf.lastIncludedIndex = index
 	rf.lastSnapshot = make([]byte, len(snapshot))
 	copy(rf.lastSnapshot, snapshot)
 	rf.needApplySnapshot = true
 	rf.notifyApply()
+
+	LogPrint(INFO, dSnap, "S%d snapshot LII=%d LIT=%d, trim log %s", rf.me, rf.lastIncludedIndex, rf.lastIncludedTerm, logStr(rf.log))
 
 	rf.persist()
 	raftlog := rf.persister.ReadRaftState()
@@ -284,7 +280,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if rf.state == LEADER {
 		isLeader = true
 		rf.log = append(rf.log, LogEntry{rf.currentTerm, command})
-		Dbg(dLog, "S%d Start T=%d ST=%d CI=%d LLI=%d %s",
+		LogPrint(INFO, dLog, "S%d Start T=%d ST=%d CI=%d LLI=%d %s",
 			rf.me, rf.currentTerm, rf.state, rf.commitIndex, rf.lastLogIndex(), rf.log[rf.logArrIndex(rf.lastLogIndex())].str())
 		rf.sendAppendEntries(false)
 	} else {
@@ -320,7 +316,7 @@ func (rf *Raft) killed() bool {
 
 func (rf *Raft) notifyApply() {
 	go func() {
-		Dbg(dLog, "S%d notify apply", rf.me)
+		LogPrint(DEBUG, dLog, "S%d notify apply", rf.me)
 		rf.applierCh <- true
 	}()
 }
@@ -342,7 +338,7 @@ func (rf *Raft) applier() {
 				rf.applyCh <- msg // may block, goroutine can not ensure sequence
 				rf.mu.Lock()
 			} else {*/
-			Dbg(dPersist, "S%d apply start lastApplied=%d CI=%d", rf.me, rf.lastApplied, rf.commitIndex)
+			LogPrint(INFO, dPersist, "S%d apply start lastApplied=%d CI=%d", rf.me, rf.lastApplied, rf.commitIndex)
 			if rf.commitIndex > rf.lastApplied {
 				for index := rf.lastApplied + 1; index <= rf.commitIndex; index++ {
 					var msg ApplyMsg
@@ -350,11 +346,11 @@ func (rf *Raft) applier() {
 						rf.needApplySnapshot = false
 						index = rf.lastIncludedIndex
 						msg = ApplyMsg{false, 0, 0, true, rf.lastSnapshot, rf.lastIncludedTerm, rf.lastIncludedIndex}
-						Dbg(dSnap, "S%d apply message LII=%d LIT=%d", rf.me, rf.lastIncludedIndex, rf.lastIncludedTerm)
+						LogPrint(INFO, dSnap, "S%d apply message LII=%d LIT=%d", rf.me, rf.lastIncludedIndex, rf.lastIncludedTerm)
 					} else {
 						msg = ApplyMsg{true, rf.log[rf.logArrIndex(index)].Command, index, false, nil, 0, 0}
 						rf.lastApplied = index
-						Dbg(dPersist, "S%d apply message lastApplied=%d CI=%d", rf.me, rf.lastApplied, rf.commitIndex)
+						LogPrint(DEBUG, dPersist, "S%d apply message lastApplied=%d CI=%d", rf.me, rf.lastApplied, rf.commitIndex)
 					}
 
 					rf.mu.Unlock()
@@ -362,7 +358,7 @@ func (rf *Raft) applier() {
 					rf.mu.Lock()
 				}
 				rf.persist()
-				Dbg(dPersist, "S%d apply message lastApplied=%d CI=%d log %s", rf.me, rf.lastApplied, rf.commitIndex, logStr(rf.log))
+				LogPrint(INFO, dPersist, "S%d apply message lastApplied=%d CI=%d log %s", rf.me, rf.lastApplied, rf.commitIndex, logStr(rf.log))
 			}
 			//}
 
@@ -481,7 +477,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	Dbg(dClient, "S%d make raft", rf.me)
+	LogPrint(INFO, dClient, "S%d make raft", rf.me)
 	rf.applyCh = applyCh
 
 	rf.convertToFollower(0)

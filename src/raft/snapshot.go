@@ -43,7 +43,7 @@ func (rf *Raft) RequestInstallSnapshot(args *InstallSnapshotArgs, reply *Install
 
 	if args.Offset == 0 {
 		if rf.lastIncludedIndex < args.LastIncludedIndex {
-			Dbg(dSnap, "S%d [LII=%d LIT=%d] receive snapshot from S%d %s, log %s",
+			LogPrint(INFO, dSnap, "S%d [LII=%d LIT=%d] receive snapshot from S%d %s, log %s",
 				rf.me, rf.lastIncludedIndex, rf.lastIncludedTerm, args.LeaderId, args.str(), logStr(rf.log))
 			var log []LogEntry
 			log = append(log, rf.log[0])
@@ -52,7 +52,6 @@ func (rf *Raft) RequestInstallSnapshot(args *InstallSnapshotArgs, reply *Install
 				log = append(log, rf.log[trimIndex:]...)
 			}
 			rf.log = log
-			Dbg(dSnap, "S%d snapshot trim log %s", rf.me, logStr(rf.log))
 
 			rf.lastSnapshot = make([]byte, len(args.Data))
 			copy(rf.lastSnapshot, args.Data)
@@ -63,6 +62,9 @@ func (rf *Raft) RequestInstallSnapshot(args *InstallSnapshotArgs, reply *Install
 				rf.commitIndex = rf.lastIncludedIndex
 			}
 			rf.needApplySnapshot = true
+
+			LogPrint(INFO, dSnap, "S%d [LII=%d LIT=%d] receive snapshot from S%d %s, trim log %s",
+				rf.me, rf.lastIncludedIndex, rf.lastIncludedTerm, args.LeaderId, args.str(), logStr(rf.log))
 
 			rf.persist()
 			raftlog := rf.persister.ReadRaftState()
