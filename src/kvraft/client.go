@@ -1,13 +1,26 @@
 package kvraft
 
-import "6.824/labrpc"
-import "crypto/rand"
-import "math/big"
+import (
+	"crypto/rand"
+	"math/big"
+	"sync"
+	"time"
 
+	"6.824/labrpc"
+	"6.824/raft"
+)
+
+var GlobalClientId int64 = 0
+var GlobalSeqId int64 = 1
+var mu sync.Mutex
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	clientId     int64
+	leaderId     int
+	currentSeqId int64
+	snowflake    *Snowflake
 }
 
 func nrand() int64 {
@@ -21,10 +34,54 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	ck.clientId = GlobalClientId
+	GlobalClientId++
+	ck.leaderId = 0
+	/*var err error
+	ck.snowflake, err = NewSnowflake(ck.clientId)
+	if err != nil {
+		panic(err)
+	}
+	ck.currentSeqId = ck.snowflake.NextID()*/
+	mu.Lock()
+	ck.currentSeqId = GlobalSeqId
+	GlobalSeqId++
+	mu.Unlock()
 	return ck
 }
 
-//
+func (ck *Clerk) processReply(op string, replyCh chan Reply) (string, bool) {
+	value := ""
+	ok := false
+
+	select {
+	case reply := <-replyCh:
+		raft.LogPrint(raft.INFO, "KVCL", "C%d recv %s response S%d %+v", ck.clientId, op, ck.leaderId, reply)
+		if reply.ok {
+			if reply.Err == OK || reply.Err == ErrNoKey {
+				value = reply.Value
+				//ck.currentSeqId = ck.snowflake.NextID()
+				mu.Lock()
+				ck.currentSeqId = GlobalSeqId
+				GlobalSeqId++
+				mu.Unlock()
+				ok = true
+			} else {
+				ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
+				time.Sleep(5 * time.Millisecond)
+			}
+		} else {
+			ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
+			time.Sleep(5 * time.Millisecond)
+		}
+	case <-time.After(4 * time.Second):
+		raft.LogPrint(raft.INFO, "KVCL", "C%d recv %s response S%d timeout", ck.clientId, op, ck.leaderId)
+		ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
+		time.Sleep(5 * time.Millisecond)
+	}
+	return value, ok
+}
+
 // fetch the current value for a key.
 // returns "" if the key does not exist.
 // keeps trying forever in the face of all other errors.
@@ -35,14 +92,35 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // the types of args and reply (including whether they are pointers)
 // must match the declared types of the RPC handler function's
 // arguments. and reply must be passed as a pointer.
-//
 func (ck *Clerk) Get(key string) string {
 
 	// You will have to modify this function.
+	if key != "" {
+		var value string
+		args := GetArgs{key, ck.clientId, ck.currentSeqId}
+
+		replyCh := make(chan Reply)
+
+		for {
+			go func(peer int, args *GetArgs) {
+				raft.LogPrint(raft.INFO, "KVCL", "C%d send Get request S%d %+v", ck.clientId, peer, args)
+				var reply GetReply
+				ok := ck.servers[peer].Call("KVServer.Get", args, &reply)
+				replyCh <- Reply{ok, reply.Err, reply.Value}
+			}(ck.leaderId, &args)
+
+			var ok bool
+			value, ok = ck.processReply("Get", replyCh)
+			if ok {
+				break
+			}
+		}
+		return value
+
+	}
 	return ""
 }
 
-//
 // shared by Put and Append.
 //
 // you can send an RPC with code like this:
@@ -51,9 +129,40 @@ func (ck *Clerk) Get(key string) string {
 // the types of args and reply (including whether they are pointers)
 // must match the declared types of the RPC handler function's
 // arguments. and reply must be passed as a pointer.
-//
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+
+	args := PutAppendArgs{key, value, op, ck.clientId, ck.currentSeqId}
+	replyCh := make(chan Reply)
+
+	for {
+		/*ok := ck.servers[ck.leaderId].Call("KVServer.PutAppend", &args, &reply)
+		raft.LogPrint(raft.INFO, "KVCL", "C%d recv put/append response S%d ok=%t %+v %+v", ck.clientId, ck.leaderId, ok, args, reply)
+		if ok {
+			if reply.Err == OK {
+				ck.currentSeqId = ck.snowflake.NextID()
+				break
+			} else {
+				ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
+				time.Sleep(5 * time.Millisecond)
+			}
+		} else {
+			ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
+			time.Sleep(5 * time.Millisecond)
+		}*/
+		go func(peer int, args *PutAppendArgs) {
+			raft.LogPrint(raft.INFO, "KVCL", "C%d send Put/Append request S%d %+v", ck.clientId, peer, args)
+			var reply PutAppendReply
+			ok := ck.servers[peer].Call("KVServer.PutAppend", args, &reply)
+			replyCh <- Reply{ok, reply.Err, ""}
+		}(ck.leaderId, &args)
+
+		var ok bool
+		_, ok = ck.processReply("Put/Append", replyCh)
+		if ok {
+			break
+		}
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {
