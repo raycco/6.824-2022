@@ -31,9 +31,10 @@ type Op struct {
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
 	Opcode int
-	SeqId  int64
-	Key    string
-	Value  string
+	//ClientId int64
+	SeqId int64
+	Key   string
+	Value string
 }
 
 type OpReply struct {
@@ -43,6 +44,7 @@ type OpReply struct {
 
 type OpCache struct {
 	term    int
+	index   int
 	op      Op
 	opR     OpReply
 	replyCh chan int64
@@ -60,12 +62,78 @@ type KVServer struct {
 	// Your definitions here.
 	kvdatabase map[string]string
 
-	ops map[int64]OpCache
+	ops       map[int64]OpCache // sequence id -> op
+	sequences map[int64]int64   // client -> sequence id
+}
 
-	getReplyCh chan OpReply
-	putReplyCh chan OpReply
+func isElementInSlice(slice []int64, target int64) bool {
+	for _, element := range slice {
+		if element == target {
+			return true
+		}
+	}
+	return false
+}
 
-	replyCond *sync.Cond
+func (kv *KVServer) pureCache() {
+
+	lastSeqIds := make([]int64, len(kv.sequences))
+	for _, value := range kv.sequences {
+		lastSeqIds = append(lastSeqIds, value)
+	}
+
+	delSeqIds := make([]int64, 0)
+	for key := range kv.ops {
+		if !isElementInSlice(lastSeqIds, key) {
+			delSeqIds = append(delSeqIds, key)
+		}
+	}
+
+	for _, seqid := range delSeqIds {
+		/*if kv.ops[seqid].replyCh != nil {
+			close(kv.ops[seqid].replyCh) // close cause receiver return
+		}*/
+		delete(kv.ops, seqid)
+	}
+}
+
+func (kv *KVServer) processRequest(op Op, seqId int64) OpReply {
+
+	/*if seqid := kv.sequences[op.ClientId]; seqid != op.SeqId {
+		delete(kv.ops, seqid)
+		kv.sequences[op.ClientId] = op.SeqId
+	}*/
+
+	var opReply OpReply
+	opCache, ok := kv.ops[seqId]
+	if ok && reflect.DeepEqual(op, opCache.op) && len(opCache.opR.Err) > 0 {
+		opReply.Err = opCache.opR.Err
+		opReply.Value = opCache.opR.Value
+	} else {
+		index, term, isLeader := kv.rf.Start(op)
+		if !isLeader {
+			opReply.Err = ErrWrongLeader
+			opReply.Value = ""
+		} else {
+			opCache = OpCache{term, index, op, OpReply{"", ""}, make(chan int64)}
+			kv.ops[seqId] = opCache
+
+			kv.mu.Unlock()
+			seqId := <-opCache.replyCh
+			kv.mu.Lock()
+
+			_, ok = kv.ops[seqId]
+			if ok {
+				opReply.Err = kv.ops[seqId].opR.Err
+				opReply.Value = kv.ops[seqId].opR.Value
+			} else {
+				opReply.Err = ErrOutOfOrder
+				opReply.Value = ""
+			}
+		}
+	}
+
+	return opReply
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -74,43 +142,42 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	defer kv.mu.Unlock()
 
 	op := Op{OP_GET, args.SeqId, args.Key, ""}
-	raft.LogPrint(raft.INFO, "KVSR", "S%d recv Get request from C%d %+v", kv.me, args.ClientId, op)
+	raft.LogPrint(raft.INFO, "KVSR", "S%d recv Get request from C%d ops len=%d %+v", kv.me, args.ClientId, len(kv.ops), op)
 
 	//term, isLeader := kv.rf.GetState()
-	term := -1
-	isLeader := false
-	opCache, ok := kv.ops[args.SeqId]
+	//kv.pureCache() // crash and then restart, kv.sequences is null, can not pure cache at the time
+
+	/*opCache, ok := kv.ops[args.SeqId]
 	if ok && reflect.DeepEqual(op, opCache.op) && len(opCache.opR.Err) > 0 {
 		reply.Err = opCache.opR.Err
 		reply.Value = opCache.opR.Value
-		return
 	} else {
-		_, term, isLeader = kv.rf.Start(op)
-		if isLeader {
-			opCache.term = term
-			opCache.op = op
-			opCache.opR = OpReply{"", ""}
-			opCache.replyCh = make(chan int64)
-			kv.ops[args.SeqId] = opCache
-		}
-	}
-
-	if !isLeader {
-		reply.Err = ErrWrongLeader
-	} else {
-		//kv.replyCond.Wait()
-		kv.mu.Unlock()
-		seqId := <-opCache.replyCh
-		kv.mu.Lock()
-
-		_, ok = kv.ops[seqId]
-		if ok {
-			reply.Err = kv.ops[seqId].opR.Err
-			reply.Value = kv.ops[seqId].opR.Value
+		index, term, isLeader := kv.rf.Start(op)
+		if !isLeader {
+			reply.Err = ErrWrongLeader
+			reply.Value = ""
 		} else {
-			reply.Err = "ErrReplyOrder"
+			opCache = OpCache{term, index, op, OpReply{"", ""}, make(chan int64)}
+			kv.ops[args.SeqId] = opCache
+
+			kv.mu.Unlock()
+			seqId := <-opCache.replyCh
+			kv.mu.Lock()
+
+			_, ok = kv.ops[seqId]
+			if ok {
+				reply.Err = kv.ops[seqId].opR.Err
+				reply.Value = kv.ops[seqId].opR.Value
+			} else {
+				reply.Err = ErrOutOfOrder
+				reply.Value = ""
+			}
 		}
-	}
+	}*/
+	opReply := kv.processRequest(op, args.SeqId)
+	reply.Err = opReply.Err
+	reply.Value = opReply.Value
+
 	raft.LogPrint(raft.INFO, "KVSR", "S%d send Get response to C%d reply %+v", kv.me, args.ClientId, reply)
 }
 
@@ -126,44 +193,40 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		op.Opcode = OP_APPEND
 	}
 
-	raft.LogPrint(raft.INFO, "KVSR", "S%d recv Put/Append request from C%d %+v", kv.me, args.ClientId, op)
+	raft.LogPrint(raft.INFO, "KVSR", "S%d recv Put/Append request from C%d ops len=%d %+v", kv.me, args.ClientId, len(kv.ops), op)
 
 	//term, isLeader := kv.rf.GetState()
+	//kv.pureCache() // crash and then restart, kv.sequences is null, can not pure cat the time
 
-	term := -1
-	isLeader := false
-	opCache, ok := kv.ops[args.SeqId]
+	/*opCache, ok := kv.ops[args.SeqId]
 	if ok && reflect.DeepEqual(op, opCache.op) && len(opCache.opR.Err) > 0 {
 		reply.Err = opCache.opR.Err
-		return
 	} else {
-		_, term, isLeader = kv.rf.Start(op)
-		if isLeader {
-			opCache.term = term
-			opCache.op = op
-			opCache.opR = OpReply{"", ""}
-			opCache.replyCh = make(chan int64)
-			kv.ops[args.SeqId] = opCache
-		}
-	}
+		index, term, isLeader := kv.rf.Start(op)
 
-	raft.LogPrint(raft.INFO, "KVSR", "S%d recv Put/Append request from C%d %+v", kv.me, args.ClientId, opCache)
-
-	if !isLeader {
-		reply.Err = ErrWrongLeader
-	} else {
-		//kv.replyCond.Wait()
-		kv.mu.Unlock()
-		seqId := <-opCache.replyCh
-		kv.mu.Lock()
-
-		_, ok = kv.ops[seqId]
-		if ok {
-			reply.Err = kv.ops[seqId].opR.Err
+		if !isLeader {
+			reply.Err = ErrWrongLeader
 		} else {
-			reply.Err = "ErrReplyOrder"
+			opCache = OpCache{term, index, op, OpReply{"", ""}, make(chan int64)}
+			kv.ops[args.SeqId] = opCache
+
+			raft.LogPrint(raft.INFO, "KVSR", "S%d recv Put/Append request from C%d cache len=%d %+v", kv.me, args.ClientId, len(kv.ops), opCache)
+
+			kv.mu.Unlock()
+			seqId := <-opCache.replyCh
+			kv.mu.Lock()
+
+			_, ok = kv.ops[seqId]
+			if ok {
+				reply.Err = kv.ops[seqId].opR.Err
+			} else {
+				reply.Err = ErrOutOfOrder
+			}
 		}
-	}
+	}*/
+	opReply := kv.processRequest(op, args.SeqId)
+	reply.Err = opReply.Err
+
 	raft.LogPrint(raft.INFO, "KVSR", "S%d send Put/Append response to C%d reply %v", kv.me, args.ClientId, reply)
 }
 
@@ -216,11 +279,11 @@ func (kv *KVServer) applier() {
 		raft.LogPrint(raft.INFO, "KVSR", "S%d recv apply msg %v", kv.me, applyMsg)
 
 		kv.mu.Lock()
-		//term, isLeader := kv.rf.GetState() // Get lock may cost time
+		//term, isLeader := kv.rf.GetState() // Get lock may cost time 20ms
 
 		op := applyMsg.Command.(Op)
-		var opReply OpReply
 
+		var opReply OpReply
 		opCache, ok := kv.ops[op.SeqId]
 		raft.LogPrint(raft.INFO, "KVSR", "S%d T=%d Leader=%t recv apply msg ok=%t %+v",
 			kv.me, applyMsg.CommandTerm, applyMsg.IsLeader, ok, opCache)
@@ -228,7 +291,7 @@ func (kv *KVServer) applier() {
 			if reflect.DeepEqual(opCache.op, op) {
 				if len(opCache.opR.Err) <= 0 {
 					opReply = kv.opExecute(op)
-					kv.ops[op.SeqId] = OpCache{opCache.term, op, opReply, opCache.replyCh}
+					kv.ops[op.SeqId] = OpCache{opCache.term, opCache.index, op, opReply, opCache.replyCh}
 					//opCache.opR = opReply
 				} else {
 					opReply = opCache.opR
@@ -238,12 +301,18 @@ func (kv *KVServer) applier() {
 			}
 		} else {
 			opReply = kv.opExecute(op)
-			kv.ops[op.SeqId] = OpCache{opCache.term, op, opReply, nil}
+			/*if seqid := kv.sequences[op.ClientId]; seqid != op.SeqId {
+				delete(kv.ops, seqid)
+				kv.sequences[op.ClientId] = op.SeqId
+			}*/
+			kv.ops[op.SeqId] = OpCache{opCache.term, opCache.index, op, opReply, nil}
 		}
 
 		if applyMsg.IsLeader {
 			if applyMsg.CommandTerm == opCache.term && opCache.replyCh != nil {
+				kv.mu.Unlock()
 				opCache.replyCh <- opCache.op.SeqId
+				kv.mu.Lock()
 			}
 		}
 
@@ -286,12 +355,9 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 	kv.kvdatabase = make(map[string]string)
-	kv.getReplyCh = make(chan OpReply)
-	kv.putReplyCh = make(chan OpReply)
 
 	kv.ops = make(map[int64]OpCache)
-
-	kv.replyCond = sync.NewCond(&kv.mu)
+	kv.sequences = make(map[int64]int64)
 
 	go kv.applier()
 
