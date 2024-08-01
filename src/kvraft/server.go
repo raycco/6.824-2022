@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"log"
 	"reflect"
-	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -32,11 +31,11 @@ type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	Opcode int
-	//ClientId int64
-	SeqId int64
-	Key   string
-	Value string
+	Opcode   int
+	ClientId int64
+	SeqId    int64
+	Key      string
+	Value    string
 }
 
 type OpReply struct {
@@ -70,8 +69,6 @@ type KVServer struct {
 	lastIncludedIndex int
 	lastIncludedTerm  int
 	lastRaftStateSize int
-
-	snapCond *sync.Cond
 }
 
 func isElementInSlice(slice []int64, target int64) bool {
@@ -105,15 +102,16 @@ func (kv *KVServer) pureCache() {
 	}
 }
 
-func (kv *KVServer) processRequest(op Op, seqId int64) OpReply {
+func (kv *KVServer) processRequest(op Op) OpReply {
 
-	/*if seqid := kv.sequences[op.ClientId]; seqid != op.SeqId {
+	raft.LogPrint(raft.DEBUG, "KVSR", "S%d process request op=%v ops=%v sequences=%v", kv.me, op, kv.ops, kv.sequences)
+	if seqid := kv.sequences[op.ClientId]; seqid != op.SeqId {
 		delete(kv.ops, seqid)
 		kv.sequences[op.ClientId] = op.SeqId
-	}*/
+	}
 
 	var opReply OpReply
-	opCache, ok := kv.ops[seqId]
+	opCache, ok := kv.ops[op.SeqId]
 	if ok && reflect.DeepEqual(op, opCache.op) && len(opCache.opR.Err) > 0 {
 		opReply.Err = opCache.opR.Err
 		opReply.Value = opCache.opR.Value
@@ -124,7 +122,7 @@ func (kv *KVServer) processRequest(op Op, seqId int64) OpReply {
 			opReply.Value = ""
 		} else {
 			opCache = &OpCache{term, index, op, OpReply{"", ""}, make(chan int64)}
-			kv.ops[seqId] = opCache
+			kv.ops[op.SeqId] = opCache
 
 			kv.mu.Unlock()
 			seqId := <-opCache.replyCh
@@ -149,8 +147,8 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
-	op := Op{OP_GET, args.SeqId, args.Key, ""}
-	raft.LogPrint(raft.INFO, "KVSR", "S%d recv Get request from C%d ops len=%d %+v", kv.me, args.ClientId, len(kv.ops), op)
+	op := Op{OP_GET, args.ClientId, args.SeqId, args.Key, ""}
+	raft.LogPrint(raft.INFO, "KVSR", "S%d recv Get request from C%d ops len=%d op=%+v", kv.me, args.ClientId, len(kv.ops), op)
 
 	//term, isLeader := kv.rf.GetState()
 	//kv.pureCache() // crash and then restart, kv.sequences is null, can not pure cache at the time
@@ -182,7 +180,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 			}
 		}
 	}*/
-	opReply := kv.processRequest(op, args.SeqId)
+	opReply := kv.processRequest(op)
 	reply.Err = opReply.Err
 	reply.Value = opReply.Value
 
@@ -194,14 +192,14 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
-	op := Op{-1, args.SeqId, args.Key, args.Value}
+	op := Op{-1, args.ClientId, args.SeqId, args.Key, args.Value}
 	if args.Op == "Put" {
 		op.Opcode = OP_PUT
 	} else {
 		op.Opcode = OP_APPEND
 	}
 
-	raft.LogPrint(raft.INFO, "KVSR", "S%d recv Put/Append request from C%d ops len=%d %+v", kv.me, args.ClientId, len(kv.ops), op)
+	raft.LogPrint(raft.INFO, "KVSR", "S%d recv Put/Append request from C%d ops len=%d op=%+v", kv.me, args.ClientId, len(kv.ops), op)
 
 	//term, isLeader := kv.rf.GetState()
 	//kv.pureCache() // crash and then restart, kv.sequences is null, can not pure cat the time
@@ -232,7 +230,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 			}
 		}
 	}*/
-	opReply := kv.processRequest(op, args.SeqId)
+	opReply := kv.processRequest(op)
 	reply.Err = opReply.Err
 
 	raft.LogPrint(raft.INFO, "KVSR", "S%d send Put/Append response to C%d reply %v", kv.me, args.ClientId, reply)
@@ -280,19 +278,7 @@ func (kv *KVServer) opExecute(op Op) OpReply {
 	return opReply
 }
 
-func (kv *KVServer) isOpExec(op Op) bool {
-	isExec := false
-	value, ok := kv.kvdatabase[op.Key]
-	if ok && strings.Contains(value, op.Value) {
-		isExec = true
-	} else {
-		isExec = false
-	}
-
-	return isExec
-}
-
-func (kv *KVServer) processOpFromApplyMsg(op Op, index int) {
+func (kv *KVServer) processOp(op Op, index int) {
 
 	term, isLeader := kv.rf.GetState()
 	var opReply OpReply
@@ -313,10 +299,10 @@ func (kv *KVServer) processOpFromApplyMsg(op Op, index int) {
 		}
 	} else {
 		opReply = kv.opExecute(op)
-		/*if seqid := kv.sequences[op.ClientId]; seqid != op.SeqId {
+		if seqid := kv.sequences[op.ClientId]; seqid != op.SeqId {
 			delete(kv.ops, seqid)
 			kv.sequences[op.ClientId] = op.SeqId
-		}*/
+		}
 		opCache = &OpCache{term, index, op, opReply, nil}
 		kv.ops[op.SeqId] = opCache
 	}
@@ -350,10 +336,9 @@ func (kv *KVServer) applier() {
 		raft.LogPrint(raft.INFO, "KVSR", "S%d recv apply msg %v", kv.me, applyMsg)
 
 		kv.mu.Lock()
-
 		if applyMsg.CommandValid {
 			op := applyMsg.Command.(Op)
-			kv.processOpFromApplyMsg(op, applyMsg.CommandIndex)
+			kv.processOp(op, applyMsg.CommandIndex)
 			kv.createSnapshot()
 		} else if applyMsg.SnapshotValid {
 			kv.ingestSnapshot(applyMsg.Snapshot, applyMsg.SnapshotIndex)
@@ -388,6 +373,7 @@ func (kv *KVServer) ingestSnapshot(snapshot []byte, index int) {
 		return
 	}
 
+	// apply message may apply one more index after create snapshot
 	for lastApplied := lastIncludedIndex + 1; lastApplied <= kv.lastIncludedIndex; lastApplied++ {
 		for _, opCache := range kv.ops {
 			if opCache.index == lastApplied {
@@ -419,16 +405,6 @@ func (kv *KVServer) createSnapshot() {
 			encoder.Encode(kv.kvdatabase)
 			kv.rf.Snapshot(kv.lastIncludedIndex, byteBuffer.Bytes())
 		}
-	}
-}
-
-func (kv *KVServer) ticker() {
-	for !kv.killed() {
-		kv.mu.Lock()
-		kv.snapCond.Wait()
-		kv.createSnapshot()
-		kv.mu.Unlock()
-		//time.Sleep(100 * time.Millisecond)
 	}
 }
 
@@ -469,11 +445,6 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.lastRaftStateSize = kv.rf.GetRaftStateSize()
 
 	go kv.applier()
-
-	/*if kv.maxraftstate != -1 {
-		kv.snapCond = sync.NewCond(&kv.mu)
-		go kv.ticker()
-	}*/
 
 	return kv
 }
