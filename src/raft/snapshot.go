@@ -26,47 +26,54 @@ func (rf *Raft) sendRequestInstallSnapshot(server int, args *InstallSnapshotArgs
 	return ok
 }
 
+func (rf *Raft) trimLog(index int) {
+	var log []LogEntry
+	log = append(log, rf.log[0])
+	trimIndex := rf.logArrIndex(index + 1)
+	if trimIndex < len(rf.log) {
+		log = append(log, rf.log[trimIndex:]...)
+	}
+	rf.log = log
+}
+
 func (rf *Raft) RequestInstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	myTerm := rf.currentTerm
+	nTerm := rf.currentTerm
 
-	if args.Term > myTerm { // leader term > my term => follower
+	if args.Term > nTerm { // leader term > my term => follower
 		rf.convertToFollower(args.Term)
 	}
 
-	if args.Term < myTerm { // leader term < my term, reject
+	if args.Term < nTerm { // leader term < my term, reject
 		reply.Term = rf.currentTerm
 		return // if the term in the AppendEntries arguments is outdated, you should not reset your timer
 	}
 
 	if args.Offset == 0 {
 		if rf.lastIncludedIndex < args.LastIncludedIndex {
-			LogPrint(INFO, dSnap, "S%d [LII=%d LIT=%d] get snapshot req from S%d %s, log %s",
-				rf.me, rf.lastIncludedIndex, rf.lastIncludedTerm, args.LeaderId, args.str(), logStr(rf.log))
-			var log []LogEntry
-			log = append(log, rf.log[0])
-			trimIndex := rf.logArrIndex(args.LastIncludedIndex + 1)
-			if trimIndex < len(rf.log) {
-				log = append(log, rf.log[trimIndex:]...)
-			}
-			rf.log = log
+			LogPrint(INFO, dSnap, "S%d [LII=%d LIT=%d] recv snapshot req from S%d %v, log %s",
+				rf.me, rf.lastIncludedIndex, rf.lastIncludedTerm, args.LeaderId, args.str(), rf.log)
 
+			rf.trimLog(args.LastIncludedIndex)
 			rf.lastSnapshot = make([]byte, len(args.Data))
 			copy(rf.lastSnapshot, args.Data)
 			rf.lastIncludedIndex = args.LastIncludedIndex
 			rf.lastIncludedTerm = args.LastIncludedTerm
+			rf.isNeedPersistSnapshot = true
+
 			rf.lastApplied = rf.lastIncludedIndex
 			if rf.commitIndex < rf.lastIncludedIndex {
 				rf.commitIndex = rf.lastIncludedIndex
 			}
-			rf.needApplySnapshot = true
 
-			LogPrint(INFO, dSnap, "S%d [LII=%d LIT=%d] get snapshot req from S%d %s, trimed log %s",
-				rf.me, rf.lastIncludedIndex, rf.lastIncludedTerm, args.LeaderId, args.str(), logStr(rf.log))
+			LogPrint(INFO, dSnap, "S%d [LII=%d LIT=%d] recv snapshot req from S%d %s, trimed log %v",
+				rf.me, rf.lastIncludedIndex, rf.lastIncludedTerm, args.LeaderId, args.str(), rf.log)
 
 			rf.persist()
+
+			rf.isNeedApplySnapshot = true
 			rf.notifyApply()
 		} else {
 			if rf.lastIncludedTerm == args.LastIncludedTerm {
@@ -89,10 +96,9 @@ func (rf *Raft) sendInstallSnapshot(peer int) {
 		args.Done = true
 
 		go func(peer int, args *InstallSnapshotArgs) {
-			LogPrint(INFO, dSnap, "S%d %s put snapshot req to S%d", rf.me, args.str(), peer)
+			LogPrint(INFO, dSnap, "S%d %s send snapshot req to S%d", rf.me, args.str(), peer)
 
 			var reply InstallSnapshotReply
-
 			ok := rf.sendRequestInstallSnapshot(peer, args, &reply)
 
 			if ok {

@@ -58,7 +58,7 @@ func (rf *Raft) logEntryTerm(index int) int {
 	MI => match index
 	NI => next index
 
-	LAI => last applied index
+	ST => state
 
 	LLI => last log entry index
 	LLT => last log entry term

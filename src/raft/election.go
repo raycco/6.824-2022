@@ -52,7 +52,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	nLLIndex := rf.lastLogIndex()
 	nLLTerm := rf.logEntryTerm(nLLIndex)
 
-	LogPrint(INFO, dVote, "S%d [T=%d VF=%d LLI=%d LLT=%d ST=%d CI=%d] get vote req from S%d %s",
+	LogPrint(INFO, dVote, "S%d [T=%d VF=%d LLI=%d LLT=%d ST=%d CI=%d] recv vote req from S%d %s",
 		rf.me, rf.currentTerm, rf.votedFor, nLLIndex, nLLTerm,
 		rf.state, rf.commitIndex, args.CandidateId, args.str())
 
@@ -142,6 +142,8 @@ func (rf *Raft) startElection() {
 	rf.convertToCandidate()
 	voteCount := 1
 
+	rf.resetElectionTimeout(rf.me) // two raft election timeout may same, then same always if not reset
+
 	nLLIndex := rf.lastLogIndex()
 	nLLTerm := rf.logEntryTerm(nLLIndex)
 	/*myLLTerm := rf.log[myLLIndex].Term
@@ -153,14 +155,14 @@ func (rf *Raft) startElection() {
 		if peer != rf.me {
 			go func(server int, args *RequestVoteArgs) {
 				var reply RequestVoteReply
-				LogPrint(INFO, dVote, "S%d %s put vote req to S%d", rf.me, args.str(), server)
+				LogPrint(INFO, dVote, "S%d %s send vote req to S%d", rf.me, args.str(), server)
 				ok := rf.sendRequestVote(server, args, &reply)
 
 				if ok {
 					rf.mu.Lock()
 					defer rf.mu.Unlock()
 
-					LogPrint(INFO, dVote, "S%d [T=%d CNT=%d] args:[T=%d] get vote res from S%d %s\n",
+					LogPrint(INFO, dVote, "S%d [T=%d CNT=%d] args:[T=%d] recv vote res from S%d %s\n",
 						rf.me, rf.currentTerm, voteCount, args.Term, server, reply.str())
 
 					if reply.Term > rf.currentTerm {
@@ -216,7 +218,7 @@ func (rf *Raft) setElectionTimeout() {
 func (rf *Raft) resetElectionTimeout(server int) {
 
 	go func(server int) {
-		LogPrint(DEBUG, dTimer, "S%d reset election timeout", server)
+		LogPrint(INFO, dTimer, "S%d reset election timeout", server)
 		rf.voteCh <- true
 	}(server)
 }
@@ -228,7 +230,7 @@ func (rf *Raft) doElection() {
 		rf.mu.Lock()
 		rf.lastElectionTimeout = rf.electionTimeout
 		rf.setElectionTimeout()
-		LogPrint(DEBUG, dTimer, "S%d reset election timeout=%d", rf.me, rf.electionTimeout/time.Millisecond)
+		LogPrint(INFO, dTimer, "S%d reset election timeout=%d", rf.me, rf.electionTimeout/time.Millisecond)
 		rf.mu.Unlock()
 
 	case <-time.After(rf.electionTimeout):
