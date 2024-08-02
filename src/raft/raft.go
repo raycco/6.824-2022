@@ -74,16 +74,15 @@ type Raft struct {
 	nextIndex  []int // for each server, index of the next log entry to send to that server (initialized to leader last log index + 1)
 	matchIndex []int // for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
 
-	voteCh              chan bool     // channel for reset timeout
 	electionTimeout     time.Duration // election timeout, also follower heartbeats timeout
 	lastElectionTimeout time.Duration
 
+	electionTime         time.Time
 	leaderHeartbeatsTime time.Time
 
 	applyCh chan ApplyMsg
 
-	applierCh chan bool
-	cond      *sync.Cond
+	applyCond *sync.Cond
 
 	lastIncludedIndex int
 	lastIncludedTerm  int
@@ -234,7 +233,7 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.lastIncludedTerm = -1
 	}
 	rf.lastApplied = rf.lastIncludedIndex
-	rf.notifyApply()
+	rf.applyCond.Broadcast()
 
 	LogPrint(INFO, dPersist, "S%d read raft state lastApplied=%d CI=%d LII=%d LIT=%d log %v",
 		rf.me, rf.lastApplied, rf.commitIndex, rf.lastIncludedIndex, rf.lastIncludedTerm, rf.log)
@@ -288,7 +287,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 	rf.isNeedApplySnapshot = true
 	rf.lastApplied = rf.lastIncludedIndex
-	rf.notifyApply()
+	rf.applyCond.Broadcast()
 
 	LogPrint(INFO, dSnap, "S%d snapshot LII=%d LIT=%d, trimed log %v", rf.me, rf.lastIncludedIndex, rf.lastIncludedTerm, rf.log)
 }
@@ -355,87 +354,52 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-func (rf *Raft) notifyApply() {
-
-	go func() {
-		LogPrint(DEBUG, dLog, "S%d notify apply", rf.me)
-		//rf.cond.Broadcast()
-		rf.applierCh <- true
-	}()
-}
-
 func (rf *Raft) applier() {
 	for !rf.killed() {
 
-		/*rf.mu.Lock()
-		var msg ApplyMsg
-		if rf.needApplySnapshot {
-			rf.needApplySnapshot = false
-			msg = ApplyMsg{false, 0, 0, true, rf.lastSnapshot, rf.lastIncludedTerm, rf.lastIncludedIndex}
-			LogPrint(INFO, dClient, "S%d apply snapshot lastApplied=%d CI=%d LII=%d LIT=%d",
-				rf.me, rf.lastApplied, rf.commitIndex, rf.lastIncludedIndex, rf.lastIncludedTerm)
-			rf.mu.Unlock()
-			rf.applyCh <- msg // may block, goroutine can not ensure sequence
-		} else if rf.commitIndex > rf.lastApplied && rf.lastApplied >= rf.lastIncludedIndex {
-			//LogPrint(INFO, dClient, "S%d apply start lastApplied=%d CI=%d", rf.me, rf.lastApplied, rf.commitIndex)
+		rf.mu.Lock()
 
-			rf.lastApplied++
-			msg = ApplyMsg{true, rf.log[rf.logArrIndex(rf.lastApplied)].Command, rf.lastApplied, false, nil, 0, 0}
-			LogPrint(DEBUG, dClient, "S%d apply lastApplied=%d CI=%d LII=%d LIT=%d",
-				rf.me, rf.lastApplied, rf.commitIndex, rf.lastIncludedIndex, rf.lastIncludedTerm)
-			rf.mu.Unlock()
-			rf.applyCh <- msg // may block, goroutine can not ensure sequence
-		} else {
-			rf.cond.Wait()
-			rf.mu.Unlock()
-		}*/
+		rf.applyCond.Wait()
+		LogPrint(INFO, dClient, "S%d apply start lastApplied=%d CI=%d", rf.me, rf.lastApplied, rf.commitIndex)
 
-		select {
-		case <-rf.applierCh:
-			rf.mu.Lock()
+		if rf.commitIndex > rf.lastApplied {
+			for index := rf.lastApplied + 1; index <= rf.commitIndex; index++ {
+				var msg ApplyMsg
+				if rf.isNeedApplySnapshot {
+					rf.isNeedApplySnapshot = false
+					index = rf.lastIncludedIndex
+					msg = ApplyMsg{
+						false, 0, 0, true,
+						rf.lastSnapshot, rf.lastIncludedTerm, rf.lastIncludedIndex}
 
-			LogPrint(INFO, dClient, "S%d apply start lastApplied=%d CI=%d", rf.me, rf.lastApplied, rf.commitIndex)
+					LogPrint(INFO, dClient, "S%d apply snapshot lastApplied=%d CI=%d LII=%d LIT=%d",
+						rf.me, rf.lastApplied, rf.commitIndex, rf.lastIncludedIndex, rf.lastIncludedTerm)
+				} else {
+					command := rf.log[rf.logArrIndex(index)].Command
+					msg = ApplyMsg{true, command, index, false, nil, 0, 0}
+					rf.lastApplied = index
 
-			if rf.commitIndex > rf.lastApplied {
-				for index := rf.lastApplied + 1; index <= rf.commitIndex; index++ {
-					var msg ApplyMsg
-					if rf.isNeedApplySnapshot {
-						rf.isNeedApplySnapshot = false
-						index = rf.lastIncludedIndex
-						msg = ApplyMsg{
-							false, 0, 0, true,
-							rf.lastSnapshot, rf.lastIncludedTerm, rf.lastIncludedIndex}
-
-						LogPrint(INFO, dClient, "S%d apply snapshot lastApplied=%d CI=%d LII=%d LIT=%d",
-							rf.me, rf.lastApplied, rf.commitIndex, rf.lastIncludedIndex, rf.lastIncludedTerm)
-					} else {
-						command := rf.log[rf.logArrIndex(index)].Command
-						msg = ApplyMsg{true, command, index, false, nil, 0, 0}
-						rf.lastApplied = index
-
-						LogPrint(DEBUG, dClient, "S%d apply lastApplied=%d CI=%d LII=%d LIT=%d",
-							rf.me, rf.lastApplied, rf.commitIndex, rf.lastIncludedIndex, rf.lastIncludedTerm)
-					}
-
-					rf.mu.Unlock()
-					rf.applyCh <- msg // may block, goroutine can not ensure sequence
-					rf.mu.Lock()
+					LogPrint(DEBUG, dClient, "S%d apply lastApplied=%d CI=%d LII=%d LIT=%d",
+						rf.me, rf.lastApplied, rf.commitIndex, rf.lastIncludedIndex, rf.lastIncludedTerm)
 				}
-				//rf.persist()
-				LogPrint(INFO, dClient, "S%d apply end lastApplied=%d CI=%d", rf.me, rf.lastApplied, rf.commitIndex)
-				LogPrint(DEBUG, dClient, "S%d apply end log %v", rf.me, rf.log)
-			}
-			rf.mu.Unlock()
 
-		case <-time.After(50 * time.Millisecond):
-			//LogPrint(INFO, dPersist, "S%d applier timeout", rf.me)
+				rf.mu.Unlock()
+				rf.applyCh <- msg // may block, goroutine can not ensure sequence
+				rf.mu.Lock()
+			}
+			//rf.persist()
+			LogPrint(INFO, dClient, "S%d apply end lastApplied=%d CI=%d", rf.me, rf.lastApplied, rf.commitIndex)
+			LogPrint(DEBUG, dClient, "S%d apply end log %v", rf.me, rf.log)
 		}
+		rf.mu.Unlock()
+
 	}
 }
 
-func (rf *Raft) resetLeaderHeastbeatsTimeout(server int) {
+func (rf *Raft) resetLeaderHeastbeatsTimeout() {
 	//LogPrint(DEBUG, dTimer, "S%d reset leader heartbeats timeout", server)
-	rf.resetElectionTimeout(server)
+	rf.leaderHeartbeatsTime = time.Now().Add(LeaderHeartbeatsTimeout)
+	rf.resetElectionTimeout()
 }
 
 func (rf *Raft) sendHeartbeats() {
@@ -443,6 +407,21 @@ func (rf *Raft) sendHeartbeats() {
 		return
 	}
 	rf.sendAppendEntries(true)
+}
+
+func (rf *Raft) tick() {
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if time.Now().After(rf.electionTime) {
+		LogPrint(INFO, dTimer, "S%d timeout, start next election", rf.me)
+		rf.startElection()
+	}
+
+	if rf.state == LEADER && time.Now().After(rf.leaderHeartbeatsTime) {
+		rf.sendHeartbeats()
+	}
 }
 
 // The ticker go routine starts a new election if this peer hasn't received
@@ -453,18 +432,8 @@ func (rf *Raft) ticker() {
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
-
-		rf.doElection()
-
-		rf.mu.Lock()
-		state := rf.state
-		rf.mu.Unlock()
-		if state == LEADER {
-			time.Sleep(LeaderHeartbeatsTimeout)
-			rf.mu.Lock()
-			rf.sendHeartbeats()
-			rf.mu.Unlock()
-		}
+		rf.tick()
+		time.Sleep(TickInterval)
 	}
 }
 
@@ -491,12 +460,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.convertToFollower(0)
 	rf.commitIndex = 0
 	rf.lastApplied = 0
+
 	rf.log = make([]LogEntry, 0)
 	rf.log = append(rf.log, LogEntry{-1, nil})
-	//rf.log = append(rf.log, LogEntry{rf.currentTerm, nil})
-	rf.voteCh = make(chan bool)
-	rf.applierCh = make(chan bool)
-	rf.cond = sync.NewCond(&rf.mu)
+
+	rf.applyCond = sync.NewCond(&rf.mu)
 
 	rf.nextIndex = make([]int, len(peers))
 	rf.matchIndex = make([]int, len(peers))

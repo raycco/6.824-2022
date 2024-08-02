@@ -12,8 +12,9 @@ const (
 	LEADER
 )
 
-const ElectionTimeout = 150 * time.Millisecond
+const ElectionTimeout = 200 * time.Millisecond
 const LeaderHeartbeatsTimeout = 100 * time.Millisecond
+const TickInterval = 20 * time.Millisecond
 
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
@@ -48,7 +49,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	nTerm := rf.currentTerm
+	nCurrentTerm := rf.currentTerm
 	nLLIndex := rf.lastLogIndex()
 	nLLTerm := rf.logEntryTerm(nLLIndex)
 
@@ -56,13 +57,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.me, rf.currentTerm, rf.votedFor, nLLIndex, nLLTerm,
 		rf.state, rf.commitIndex, args.CandidateId, args.str())
 
-	reply.Term = nTerm
+	reply.Term = nCurrentTerm
 
-	if args.Term > nTerm {
+	if args.Term > nCurrentTerm {
 		rf.convertToFollower(args.Term)
 	}
 
-	if args.Term <= nTerm || (rf.votedFor != -1 && args.CandidateId != rf.votedFor) {
+	if args.Term <= nCurrentTerm || (rf.votedFor != -1 && args.CandidateId != rf.votedFor) {
 		reply.VoteGranted = false
 		return
 	}
@@ -74,7 +75,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	rf.votedFor = args.CandidateId
 	reply.VoteGranted = true
-	rf.resetElectionTimeout(rf.me)
+	rf.resetElectionTimeout()
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -133,23 +134,20 @@ func (rf *Raft) convertToLeader() {
 		rf.nextIndex[peer] = rf.lastLogIndex() + 1
 		rf.matchIndex[peer] = rf.commitIndex
 	}
+
+	rf.persist()
 }
 
 func (rf *Raft) startElection() {
-	//rf.mu.Lock()
-	//defer rf.mu.Unlock()
 
 	rf.convertToCandidate()
-	voteCount := 1
+	nVoteCount := 1
 
-	rf.resetElectionTimeout(rf.me) // two raft election timeout may same, then same always if not reset
+	rf.resetElectionTimeout() // two raft election timeout may same, then same always if not reset
 
 	nLLIndex := rf.lastLogIndex()
 	nLLTerm := rf.logEntryTerm(nLLIndex)
-	/*myLLTerm := rf.log[myLLIndex].Term
-	if rf.lastIncludedIndex == rf.lastLogIndex() {
-		myLLTerm = rf.lastIncludedTerm
-	}*/
+
 	args := &RequestVoteArgs{rf.currentTerm, rf.me, nLLIndex, nLLTerm}
 	for peer := 0; peer < len(rf.peers); peer++ {
 		if peer != rf.me {
@@ -163,16 +161,16 @@ func (rf *Raft) startElection() {
 					defer rf.mu.Unlock()
 
 					LogPrint(INFO, dVote, "S%d [T=%d CNT=%d] args:[T=%d] recv vote res from S%d %s\n",
-						rf.me, rf.currentTerm, voteCount, args.Term, server, reply.str())
+						rf.me, rf.currentTerm, nVoteCount, args.Term, server, reply.str())
 
 					if reply.Term > rf.currentTerm {
 						rf.convertToFollower(reply.Term)
 					}
 
 					if reply.VoteGranted {
-						voteCount += 1
-						if voteCount > len(rf.peers)/2 && args.Term == rf.currentTerm {
-							voteCount = 0
+						nVoteCount += 1
+						if nVoteCount > len(rf.peers)/2 && args.Term == rf.currentTerm {
+							nVoteCount = 0
 							rf.convertToLeader()
 							rf.sendHeartbeats()
 						}
@@ -213,34 +211,10 @@ func (rf *Raft) startElection() {
 
 func (rf *Raft) setElectionTimeout() {
 	rf.electionTimeout = ElectionTimeout + time.Duration(rand.Intn(150))*time.Millisecond
+	rf.electionTime = time.Now().Add(rf.electionTimeout)
+	LogPrint(INFO, dTimer, "S%d reset election timeout=%v", rf.me, rf.electionTimeout)
 }
 
-func (rf *Raft) resetElectionTimeout(server int) {
-
-	go func(server int) {
-		LogPrint(INFO, dTimer, "S%d reset election timeout", server)
-		rf.voteCh <- true
-	}(server)
-}
-
-func (rf *Raft) doElection() {
-
-	select {
-	case <-rf.voteCh:
-		rf.mu.Lock()
-		rf.lastElectionTimeout = rf.electionTimeout
-		rf.setElectionTimeout()
-		LogPrint(INFO, dTimer, "S%d reset election timeout=%d", rf.me, rf.electionTimeout/time.Millisecond)
-		rf.mu.Unlock()
-
-	case <-time.After(rf.electionTimeout):
-		rf.mu.Lock()
-		LogPrint(INFO, dTimer, "S%d timeout, start next election", rf.me)
-		if rf.lastElectionTimeout == rf.electionTimeout {
-			rf.startElection()
-		} else {
-			rf.lastElectionTimeout = rf.electionTimeout
-		}
-		rf.mu.Unlock()
-	}
+func (rf *Raft) resetElectionTimeout() {
+	rf.setElectionTimeout()
 }

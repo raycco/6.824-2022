@@ -95,7 +95,7 @@ func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *Requ
 		return // if the term in the AppendEntries arguments is outdated, you should not reset your timer
 	}
 
-	rf.resetElectionTimeout(rf.me)
+	rf.resetElectionTimeout()
 
 	if args.PrevLogIndex < rf.lastIncludedIndex {
 		reply.Term = rf.currentTerm
@@ -151,7 +151,7 @@ func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *Requ
 		} else {
 			rf.commitIndex = rf.lastLogIndex()
 		}
-		rf.notifyApply()
+		rf.applyCond.Broadcast()
 		isNeedPersist = true
 	}
 
@@ -204,13 +204,14 @@ func (rf *Raft) processAppendEntriesReply(peer int, args *RequestAppendEntriesAr
 
 	LogPrint(INFO, dLeader, "S%d T=%d %s recv append entries res from S%d %s", rf.me, rf.currentTerm, args.str(), peer, reply.str())
 
-	if reply.Term > rf.currentTerm {
+	nCurrentTerm := rf.currentTerm
+	if reply.Term > nCurrentTerm {
 		rf.convertToFollower(reply.Term)
 	}
 
 	if reply.Success {
 
-		if args.Term == rf.currentTerm {
+		if args.Term == nCurrentTerm {
 			matchIndex := args.PrevLogIndex + len(args.Entries)
 			if matchIndex > rf.matchIndex[peer] { // respone reorder
 				rf.matchIndex[peer] = matchIndex
@@ -221,38 +222,41 @@ func (rf *Raft) processAppendEntriesReply(peer int, args *RequestAppendEntriesAr
 				rf.nextIndex[peer] = nextIndex
 			}
 
-			LogPrint(INFO, dLeader, "S%d [T=%d MI=%d NI=%d CI=%d LII=%d LIT=%d] recv append entries res from S%d",
-				rf.me, args.Term, rf.matchIndex[peer], rf.nextIndex[peer], rf.commitIndex,
-				rf.lastIncludedIndex, rf.lastIncludedTerm, peer)
-		}
-
-		count := 1
-		minIndex := rf.matchIndex[peer]
-		for i := 0; i < len(rf.matchIndex); i++ {
-			if i != rf.me && rf.matchIndex[i] > rf.commitIndex {
-				count++
-				if rf.matchIndex[i] < minIndex { // the min index for commit
-					minIndex = rf.matchIndex[i]
+			nCount := 1
+			nIndex := rf.matchIndex[peer]
+			for i := 0; i < len(rf.matchIndex); i++ {
+				if i != rf.me && rf.matchIndex[i] > rf.commitIndex {
+					nCount++
+					if rf.matchIndex[i] < nIndex { // the min index for commit
+						nIndex = rf.matchIndex[i]
+					}
 				}
 			}
-		}
 
-		if count > len(rf.peers)/2 && rf.log[rf.logArrIndex(minIndex)].Term == rf.currentTerm {
-			rf.commitIndex = minIndex
+			nIndexTerm := rf.log[rf.logArrIndex(nIndex)].Term
 
-			LogPrint(INFO, dLeader, "S%d recv append entries res from S%d, majority [T=%d CI=%d]",
-				rf.me, peer, args.Term, rf.commitIndex)
+			LogPrint(INFO, dLeader, "S%d [T=%d MI=%d NI=%d CI=%d LII=%d LIT=%d CNT=%d MINI=%d MINT=%d] recv append entries res from S%d",
+				rf.me, args.Term, rf.matchIndex[peer], rf.nextIndex[peer], rf.commitIndex,
+				rf.lastIncludedIndex, rf.lastIncludedTerm, nCount, nIndex, nIndexTerm, peer)
 
-			rf.notifyApply()
-			rf.persist()
-			//rf.matchIndex[rf.me] = rf.commitIndex
-			//rf.nextIndex[rf.me] = rf.matchIndex[rf.me] + 1
+			if nCount > len(rf.peers)/2 && nIndexTerm == nCurrentTerm {
+				rf.commitIndex = nIndex
+
+				LogPrint(INFO, dLeader, "S%d recv append entries res from S%d, majority [T=%d CI=%d]",
+					rf.me, peer, args.Term, rf.commitIndex)
+
+				rf.applyCond.Broadcast()
+				//rf.persist()
+				//rf.sendHeartbeats() // improve execute time, is it need ?
+
+				//rf.matchIndex[rf.me] = rf.commitIndex
+				//rf.nextIndex[rf.me] = rf.matchIndex[rf.me] + 1
+			}
 		}
 	} else {
 		LogPrint(INFO, dLeader, "S%d [T=%d ST=%d] args:[T=%d] recv append entries res from S%d",
-			rf.me, rf.currentTerm, rf.state, args.Term, peer)
-		if args.Term == rf.currentTerm &&
-			reply.ConflictIndex < rf.nextIndex[peer] { // reponse reorder
+			rf.me, nCurrentTerm, rf.state, args.Term, peer)
+		if args.Term == nCurrentTerm && reply.ConflictIndex < rf.nextIndex[peer] { // reponse reorder
 			rf.nextIndex[peer] = reply.ConflictIndex
 			//rf.nextIndex[peer] -= 1
 			//rf.matchIndex[peer] -= 1
@@ -280,7 +284,7 @@ func (rf *Raft) sendAppendEntries(heartbeats bool) {
 			}(peer, args)
 		} else {
 			if heartbeats {
-				rf.resetLeaderHeastbeatsTimeout(peer)
+				rf.resetLeaderHeastbeatsTimeout()
 			}
 		}
 	}

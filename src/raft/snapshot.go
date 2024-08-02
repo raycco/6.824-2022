@@ -74,7 +74,7 @@ func (rf *Raft) RequestInstallSnapshot(args *InstallSnapshotArgs, reply *Install
 			rf.persist()
 
 			rf.isNeedApplySnapshot = true
-			rf.notifyApply()
+			rf.applyCond.Broadcast()
 		} else {
 			if rf.lastIncludedTerm == args.LastIncludedTerm {
 
