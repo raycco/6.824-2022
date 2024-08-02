@@ -245,7 +245,6 @@ func (rf *Raft) processAppendEntriesReply(peer int, args *RequestAppendEntriesAr
 				LogPrint(INFO, dLeader, "S%d recv append entries res from S%d, majority [T=%d CI=%d]",
 					rf.me, peer, args.Term, rf.commitIndex)
 
-				rf.applyCond.Broadcast()
 				//rf.persist()
 				//rf.sendHeartbeats() // improve execute time, is it need ?
 
@@ -264,6 +263,10 @@ func (rf *Raft) processAppendEntriesReply(peer int, args *RequestAppendEntriesAr
 				rf.sendInstallSnapshot(peer)
 			}
 		}
+	}
+
+	if rf.commitIndex > rf.lastApplied {
+		rf.applyCond.Broadcast()
 	}
 }
 
