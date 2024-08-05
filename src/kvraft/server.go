@@ -104,7 +104,7 @@ func (kv *KVServer) pureCache() {
 
 func (kv *KVServer) processRequest(op Op) OpReply {
 
-	raft.LogPrint(raft.DEBUG, "KVSR", "S%d process request op=%v ops=%v sequences=%v", kv.me, op, kv.ops, kv.sequences)
+	raft.LogPrint(raft.DEBUG, dKvServer, "S%d process request op=%v ops=%v sequences=%v", kv.me, op, kv.ops, kv.sequences)
 	if seqid := kv.sequences[op.ClientId]; seqid != op.SeqId {
 		delete(kv.ops, seqid)
 		kv.sequences[op.ClientId] = op.SeqId
@@ -148,7 +148,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	defer kv.mu.Unlock()
 
 	op := Op{OP_GET, args.ClientId, args.SeqId, args.Key, ""}
-	raft.LogPrint(raft.INFO, "KVSR", "S%d recv Get request from C%d ops len=%d op=%+v", kv.me, args.ClientId, len(kv.ops), op)
+	raft.LogPrint(raft.INFO, dKvServer, "S%d recv Get request from C%d ops len=%d op=%+v", kv.me, args.ClientId, len(kv.ops), op)
 
 	//term, isLeader := kv.rf.GetState()
 	//kv.pureCache() // crash and then restart, kv.sequences is null, can not pure cache at the time
@@ -184,7 +184,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	reply.Err = opReply.Err
 	reply.Value = opReply.Value
 
-	raft.LogPrint(raft.INFO, "KVSR", "S%d send Get response to C%d reply %+v", kv.me, args.ClientId, reply)
+	raft.LogPrint(raft.INFO, dKvServer, "S%d send Get response to C%d reply %+v", kv.me, args.ClientId, reply)
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
@@ -199,7 +199,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		op.Opcode = OP_APPEND
 	}
 
-	raft.LogPrint(raft.INFO, "KVSR", "S%d recv Put/Append request from C%d ops len=%d op=%+v", kv.me, args.ClientId, len(kv.ops), op)
+	raft.LogPrint(raft.INFO, dKvServer, "S%d recv Put/Append request from C%d ops len=%d op=%+v", kv.me, args.ClientId, len(kv.ops), op)
 
 	//term, isLeader := kv.rf.GetState()
 	//kv.pureCache() // crash and then restart, kv.sequences is null, can not pure cat the time
@@ -233,7 +233,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	opReply := kv.processRequest(op)
 	reply.Err = opReply.Err
 
-	raft.LogPrint(raft.INFO, "KVSR", "S%d send Put/Append response to C%d reply %v", kv.me, args.ClientId, reply)
+	raft.LogPrint(raft.INFO, dKvServer, "S%d send Put/Append response to C%d reply %v", kv.me, args.ClientId, reply)
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -283,7 +283,7 @@ func (kv *KVServer) processOp(op Op, index int) {
 	term, isLeader := kv.rf.GetState()
 	var opReply OpReply
 	opCache, ok := kv.ops[op.SeqId]
-	raft.LogPrint(raft.INFO, "KVSR", "S%d T=%d Leader=%t recv apply msg ok=%t %+v", kv.me, term, isLeader, ok, opCache)
+	raft.LogPrint(raft.INFO, dKvServer, "S%d T=%d Leader=%t recv apply msg ok=%t %+v", kv.me, term, isLeader, ok, opCache)
 	if ok {
 		if reflect.DeepEqual(opCache.op, op) {
 			if len(opCache.opR.Err) <= 0 {
@@ -333,7 +333,7 @@ func (kv *KVServer) applier() {
 	for !kv.killed() {
 
 		applyMsg := <-kv.applyCh
-		raft.LogPrint(raft.INFO, "KVSR", "S%d recv apply msg %v", kv.me, applyMsg)
+		raft.LogPrint(raft.INFO, dKvServer, "S%d recv apply msg %v", kv.me, applyMsg)
 
 		kv.mu.Lock()
 		if applyMsg.CommandValid {
@@ -345,7 +345,7 @@ func (kv *KVServer) applier() {
 			kv.lastRaftStateSize = kv.rf.GetRaftStateSize()
 		} else {
 			// Ignore other types of ApplyMsg.
-			raft.LogPrint(raft.WARN, "KVSR", "S%d recv unknown type apply msg %v", kv.me, applyMsg)
+			raft.LogPrint(raft.WARN, dKvServer, "S%d recv unknown type apply msg %v", kv.me, applyMsg)
 		}
 		kv.mu.Unlock()
 	}
@@ -353,7 +353,7 @@ func (kv *KVServer) applier() {
 
 func (kv *KVServer) ingestSnapshot(snapshot []byte, index int) {
 	if snapshot == nil {
-		raft.LogPrint(raft.ERROR, "KVSR", "S%d snapshot is nil", kv.me)
+		raft.LogPrint(raft.ERROR, dKvServer, "S%d snapshot is nil", kv.me)
 		return
 	}
 
@@ -365,11 +365,11 @@ func (kv *KVServer) ingestSnapshot(snapshot []byte, index int) {
 	if decoder.Decode(&lastIncludedIndex) != nil ||
 		decoder.Decode(&lastIncludedTerm) != nil ||
 		decoder.Decode(&kvdatabase) != nil {
-		raft.LogPrint(raft.ERROR, "KVSR", "S%d snapshot Decode() error", kv.me)
+		raft.LogPrint(raft.ERROR, dKvServer, "S%d snapshot Decode() error", kv.me)
 		return
 	}
 	if index != -1 && index != lastIncludedIndex {
-		raft.LogPrint(raft.ERROR, "KVSR", "S%d snapshot doesn't match m.SnapshotIndex", kv.me)
+		raft.LogPrint(raft.ERROR, dKvServer, "S%d snapshot doesn't match m.SnapshotIndex", kv.me)
 		return
 	}
 
@@ -386,17 +386,17 @@ func (kv *KVServer) ingestSnapshot(snapshot []byte, index int) {
 	kv.lastIncludedTerm = lastIncludedTerm
 	kv.kvdatabase = kvdatabase
 
-	raft.LogPrint(raft.INFO, "KVSR", "S%d ingest snapshot LII=%d LIT=%d", kv.me, kv.lastIncludedIndex, kv.lastIncludedTerm)
-	raft.LogPrint(raft.DEBUG, "KVSR", "S%d ingest snapshot kvdatabase = %+v", kv.me, kv.kvdatabase)
+	raft.LogPrint(raft.INFO, dKvServer, "S%d ingest snapshot LII=%d LIT=%d", kv.me, kv.lastIncludedIndex, kv.lastIncludedTerm)
+	raft.LogPrint(raft.DEBUG, dKvServer, "S%d ingest snapshot kvdatabase = %+v", kv.me, kv.kvdatabase)
 }
 
 func (kv *KVServer) createSnapshot() {
 	if kv.maxraftstate != -1 {
 		raftStateSize := kv.rf.GetRaftStateSize()
 		if raftStateSize-kv.lastRaftStateSize >= kv.maxraftstate {
-			raft.LogPrint(raft.INFO, "KVSR", "S%d RSS=%d LRSS=%d LII=%d LIT=%d",
+			raft.LogPrint(raft.INFO, dKvServer, "S%d RSS=%d LRSS=%d LII=%d LIT=%d",
 				kv.me, raftStateSize, kv.lastRaftStateSize, kv.lastIncludedIndex, kv.lastIncludedTerm)
-			raft.LogPrint(raft.DEBUG, "KVSR", "S%d kvdatabase = %+v", kv.me, kv.kvdatabase)
+			raft.LogPrint(raft.DEBUG, dKvServer, "S%d kvdatabase = %+v", kv.me, kv.kvdatabase)
 
 			byteBuffer := new(bytes.Buffer)
 			encoder := labgob.NewEncoder(byteBuffer)

@@ -10,6 +10,8 @@ import (
 	"6.824/raft"
 )
 
+const RetryInterval = 10 * time.Millisecond
+
 var GlobalClientId int64 = 0
 var GlobalSeqId int64 = 1
 var mu sync.Mutex
@@ -50,13 +52,18 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	return ck
 }
 
+func (ck *Clerk) tryNextSever() {
+	ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
+	time.Sleep(RetryInterval)
+}
+
 func (ck *Clerk) processReply(op string, replyCh chan Reply) (string, bool) {
 	value := ""
 	ok := false
 
 	select {
 	case reply := <-replyCh:
-		raft.LogPrint(raft.INFO, "KVCL", "C%d recv %s response S%d %+v", ck.clientId, op, ck.leaderId, reply)
+		raft.LogPrint(raft.INFO, dKvClient, "C%d recv %s response S%d %+v", ck.clientId, op, ck.leaderId, reply)
 		if reply.ok {
 			if reply.Err == OK || reply.Err == ErrNoKey {
 				value = reply.Value
@@ -67,17 +74,14 @@ func (ck *Clerk) processReply(op string, replyCh chan Reply) (string, bool) {
 				mu.Unlock()
 				ok = true
 			} else {
-				ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
-				time.Sleep(5 * time.Millisecond)
+				ck.tryNextSever()
 			}
 		} else {
-			ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
-			time.Sleep(5 * time.Millisecond)
+			ck.tryNextSever()
 		}
 	case <-time.After(4 * time.Second):
-		raft.LogPrint(raft.INFO, "KVCL", "C%d recv %s response S%d timeout", ck.clientId, op, ck.leaderId)
-		ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
-		time.Sleep(5 * time.Millisecond)
+		raft.LogPrint(raft.INFO, dKvClient, "C%d recv %s response S%d timeout", ck.clientId, op, ck.leaderId)
+		ck.tryNextSever()
 	}
 	return value, ok
 }
@@ -103,7 +107,7 @@ func (ck *Clerk) Get(key string) string {
 
 		for {
 			go func(peer int, args *GetArgs) {
-				raft.LogPrint(raft.INFO, "KVCL", "C%d send Get request S%d %+v", ck.clientId, peer, args)
+				raft.LogPrint(raft.INFO, dKvClient, "C%d send Get request S%d %+v", ck.clientId, peer, args)
 				var reply GetReply
 				ok := ck.servers[peer].Call("KVServer.Get", args, &reply)
 				replyCh <- Reply{ok, reply.Err, reply.Value}
@@ -151,7 +155,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 			time.Sleep(5 * time.Millisecond)
 		}*/
 		go func(peer int, args *PutAppendArgs) {
-			raft.LogPrint(raft.INFO, "KVCL", "C%d send Put/Append request S%d %+v", ck.clientId, peer, args)
+			raft.LogPrint(raft.INFO, dKvClient, "C%d send Put/Append request S%d %+v", ck.clientId, peer, args)
 			var reply PutAppendReply
 			ok := ck.servers[peer].Call("KVServer.PutAppend", args, &reply)
 			replyCh <- Reply{ok, reply.Err, ""}

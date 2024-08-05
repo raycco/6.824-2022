@@ -1,5 +1,12 @@
 package kvraft
 
+import "6.824/raft"
+
+const (
+	dKvServer raft.LogTopic = "KVSR"
+	dKvClient raft.LogTopic = "KVCL"
+)
+
 const (
 	OK             = "OK"
 	ErrNoKey       = "ErrNoKey"
