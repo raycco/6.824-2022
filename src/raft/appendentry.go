@@ -83,13 +83,13 @@ func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *Requ
 		rf.me, rf.currentTerm, rf.lastLogIndex(), rf.log[rf.logArrIndex(rf.lastLogIndex())].Term, rf.state,
 		rf.commitIndex, rf.lastIncludedIndex, rf.lastIncludedTerm, args.LeaderId, args.str(), len(args.Entries))
 
-	nTerm := rf.currentTerm
+	nCurrentTerm := rf.currentTerm
 
-	if args.Term > nTerm { // leader term > my term => follower
+	if args.Term > nCurrentTerm { // leader term > my term => follower
 		rf.convertToFollower(args.Term)
 	}
 
-	if args.Term < nTerm { // leader term < my term, reject
+	if args.Term < nCurrentTerm { // leader term < my term, reject
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		return // if the term in the AppendEntries arguments is outdated, you should not reset your timer
@@ -151,12 +151,15 @@ func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *Requ
 		} else {
 			rf.commitIndex = rf.lastLogIndex()
 		}
-		rf.applyCond.Broadcast()
 		isNeedPersist = true
 	}
 
 	if isNeedPersist {
 		rf.persist()
+	}
+
+	if rf.commitIndex > rf.lastApplied {
+		rf.applyCond.Broadcast()
 	}
 
 	reply.Term = rf.currentTerm
@@ -224,8 +227,10 @@ func (rf *Raft) processAppendEntriesReply(peer int, args *RequestAppendEntriesAr
 
 			nCount := 1
 			nIndex := rf.matchIndex[peer]
+			nIndexTerm := -1
 			for i := 0; i < len(rf.matchIndex); i++ {
-				if i != rf.me && rf.matchIndex[i] > rf.commitIndex {
+				nIndexTerm = rf.log[rf.logArrIndex(nIndex)].Term
+				if i != rf.me && rf.matchIndex[i] > rf.commitIndex && nIndexTerm == nCurrentTerm {
 					nCount++
 					if rf.matchIndex[i] < nIndex { // the min index for commit
 						nIndex = rf.matchIndex[i]
@@ -233,13 +238,11 @@ func (rf *Raft) processAppendEntriesReply(peer int, args *RequestAppendEntriesAr
 				}
 			}
 
-			nIndexTerm := rf.log[rf.logArrIndex(nIndex)].Term
-
-			LogPrint(INFO, dLeader, "S%d [T=%d MI=%d NI=%d CI=%d LII=%d LIT=%d CNT=%d MINI=%d MINT=%d] recv append entries res from S%d",
+			LogPrint(INFO, dLeader, "S%d [T=%d MI=%d NI=%d CI=%d LII=%d LIT=%d CNT=%d N=%d NT=%d] recv append entries res from S%d",
 				rf.me, args.Term, rf.matchIndex[peer], rf.nextIndex[peer], rf.commitIndex,
 				rf.lastIncludedIndex, rf.lastIncludedTerm, nCount, nIndex, nIndexTerm, peer)
 
-			if nCount > len(rf.peers)/2 && nIndexTerm == nCurrentTerm {
+			if nCount > len(rf.peers)/2 {
 				rf.commitIndex = nIndex
 
 				LogPrint(INFO, dLeader, "S%d recv append entries res from S%d, majority [T=%d CI=%d]",

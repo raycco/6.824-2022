@@ -13,7 +13,7 @@ const (
 )
 
 const ElectionTimeout = 200 * time.Millisecond
-const LeaderHeartbeatsTimeout = 100 * time.Millisecond
+const LeaderHeartbeatsTimeout = 80 * time.Millisecond
 const TickInterval = 20 * time.Millisecond
 
 // example RequestVote RPC arguments structure.

@@ -53,7 +53,7 @@ func (rf *Raft) RequestInstallSnapshot(args *InstallSnapshotArgs, reply *Install
 
 	if args.Offset == 0 {
 		if rf.lastIncludedIndex < args.LastIncludedIndex {
-			LogPrint(INFO, dSnap, "S%d [LII=%d LIT=%d] recv snapshot req from S%d %v, log %s",
+			LogPrint(INFO, dSnap, "S%d [LII=%d LIT=%d] recv snapshot req from S%d %s, log %v",
 				rf.me, rf.lastIncludedIndex, rf.lastIncludedTerm, args.LeaderId, args.str(), rf.log)
 
 			rf.trimLog(args.LastIncludedIndex)
