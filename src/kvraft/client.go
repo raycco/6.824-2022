@@ -11,6 +11,7 @@ import (
 )
 
 const RetryInterval = 10 * time.Millisecond
+const RequestTimeout = 4000 * time.Millisecond
 
 var GlobalClientId int64 = 0
 var GlobalSeqId int64 = 1
@@ -19,6 +20,7 @@ var mu sync.Mutex
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	mu           sync.Mutex
 	clientId     int64
 	leaderId     int
 	currentSeqId int64
@@ -39,16 +41,16 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck.clientId = GlobalClientId
 	GlobalClientId++
 	ck.leaderId = 0
-	/*var err error
+	var err error
 	ck.snowflake, err = NewSnowflake(ck.clientId)
 	if err != nil {
 		panic(err)
 	}
-	ck.currentSeqId = ck.snowflake.NextID()*/
-	mu.Lock()
+	ck.currentSeqId = ck.snowflake.NextID()
+	/*mu.Lock()
 	ck.currentSeqId = GlobalSeqId
 	GlobalSeqId++
-	mu.Unlock()
+	mu.Unlock()*/
 	return ck
 }
 
@@ -67,11 +69,11 @@ func (ck *Clerk) processReply(op string, replyCh chan Reply) (string, bool) {
 		if reply.ok {
 			if reply.Err == OK || reply.Err == ErrNoKey {
 				value = reply.Value
-				//ck.currentSeqId = ck.snowflake.NextID()
-				mu.Lock()
+				ck.currentSeqId = ck.snowflake.NextID()
+				/*mu.Lock()
 				ck.currentSeqId = GlobalSeqId
 				GlobalSeqId++
-				mu.Unlock()
+				mu.Unlock()*/
 				ok = true
 			} else {
 				ck.tryNextSever()
@@ -79,7 +81,7 @@ func (ck *Clerk) processReply(op string, replyCh chan Reply) (string, bool) {
 		} else {
 			ck.tryNextSever()
 		}
-	case <-time.After(4 * time.Second):
+	case <-time.After(RequestTimeout):
 		raft.LogPrint(raft.INFO, dKvClient, "C%d recv %s response S%d timeout", ck.clientId, op, ck.leaderId)
 		ck.tryNextSever()
 	}
@@ -99,6 +101,8 @@ func (ck *Clerk) processReply(op string, replyCh chan Reply) (string, bool) {
 func (ck *Clerk) Get(key string) string {
 
 	// You will have to modify this function.
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
 	if key != "" {
 		var value string
 		args := GetArgs{key, ck.clientId, ck.currentSeqId}
@@ -135,11 +139,14 @@ func (ck *Clerk) Get(key string) string {
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
 
 	args := PutAppendArgs{key, value, op, ck.clientId, ck.currentSeqId}
 	replyCh := make(chan Reply)
 
 	for {
+
 		/*ok := ck.servers[ck.leaderId].Call("KVServer.PutAppend", &args, &reply)
 		raft.LogPrint(raft.INFO, "KVCL", "C%d recv put/append response S%d ok=%t %+v %+v", ck.clientId, ck.leaderId, ok, args, reply)
 		if ok {
@@ -154,6 +161,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 			ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
 			time.Sleep(5 * time.Millisecond)
 		}*/
+
 		go func(peer int, args *PutAppendArgs) {
 			raft.LogPrint(raft.INFO, dKvClient, "C%d send Put/Append request S%d %+v", ck.clientId, peer, args)
 			var reply PutAppendReply
