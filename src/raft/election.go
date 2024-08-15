@@ -12,7 +12,7 @@ const (
 	LEADER
 )
 
-const ElectionTimeout = 200 * time.Millisecond
+const ElectionTimeout = 150 * time.Millisecond
 const LeaderHeartbeatsTimeout = 80 * time.Millisecond
 const TickInterval = 20 * time.Millisecond
 

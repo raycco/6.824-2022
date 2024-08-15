@@ -74,6 +74,23 @@ func (rf *Raft) searchConflictIndex1(prevLogIndex int) int {
 	return index + 1
 }
 
+func (rf *Raft) searchConflictIndex(lastLogIndex int, prevLogIndex int, prevLogTerm int) int {
+	index := prevLogIndex
+	for {
+		if lastLogIndex < 100 {
+			index = rf.searchConflictIndex1(prevLogIndex)
+		} else {
+			index = rf.searchConflictIndex2(prevLogIndex, rf.logEntryTerm(prevLogIndex))
+		}
+
+		if rf.logEntryTerm(index-1) <= prevLogTerm {
+			break
+		}
+		prevLogIndex = index - 1
+	}
+	return index
+}
+
 func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply) {
 
 	rf.mu.Lock()
@@ -113,11 +130,7 @@ func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *Requ
 		if nLLIndex < args.PrevLogIndex {
 			reply.ConflictIndex = nLLIndex + 1
 		} else {
-			if nLLIndex < 100 {
-				reply.ConflictIndex = rf.searchConflictIndex1(args.PrevLogIndex)
-			} else {
-				reply.ConflictIndex = rf.searchConflictIndex2(args.PrevLogIndex, rf.logEntryTerm(args.PrevLogIndex))
-			}
+			reply.ConflictIndex = rf.searchConflictIndex(nLLIndex, args.PrevLogIndex, args.PrevLogTerm)
 		}
 		return
 	} else if lenEntries > 0 {
@@ -260,6 +273,7 @@ func (rf *Raft) processAppendEntriesReply(peer int, args *RequestAppendEntriesAr
 			rf.me, nCurrentTerm, rf.state, args.Term, peer)
 		if args.Term == nCurrentTerm && reply.ConflictIndex < rf.nextIndex[peer] { // reponse reorder
 			rf.nextIndex[peer] = reply.ConflictIndex
+
 			//rf.nextIndex[peer] -= 1
 			//rf.matchIndex[peer] -= 1
 			if rf.state == LEADER && rf.nextIndex[peer] <= rf.lastIncludedIndex {
