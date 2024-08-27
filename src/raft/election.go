@@ -12,8 +12,8 @@ const (
 	LEADER
 )
 
-const ElectionTimeout = 150 * time.Millisecond
-const LeaderHeartbeatsTimeout = 80 * time.Millisecond
+const ElectionTimeout = 300 * time.Millisecond
+const LeaderHeartbeatsTimeout = 100 * time.Millisecond
 const TickInterval = 20 * time.Millisecond
 
 // example RequestVote RPC arguments structure.
@@ -114,12 +114,18 @@ func (rf *Raft) convertToFollower(term int) {
 	rf.state = FOLLOWER
 	rf.currentTerm = term
 	rf.votedFor = -1
+
+	if term > 0 {
+		rf.persist()
+	}
 }
 
 func (rf *Raft) convertToCandidate() {
 	rf.state = CANDIDATE
 	rf.currentTerm += 1
 	rf.votedFor = rf.me
+
+	rf.persist()
 }
 
 func (rf *Raft) convertToLeader() {

@@ -23,11 +23,12 @@ type RequestAppendEntriesReply struct {
 	Term          int  // currentTerm, for leader to update itself
 	Success       bool // true if follower contained entry matching prevLogIndex and prevLogTerm
 	ConflictIndex int  // the protocol can be optimized to reduce the number of rejected AppendEntries RPCs
+	ConflictTerm  int
 }
 
 func (reply *RequestAppendEntriesReply) str() string {
-	return fmt.Sprintf("reply:[T=%d CONI=%d SUCC=%t]",
-		reply.Term, reply.ConflictIndex, reply.Success)
+	return fmt.Sprintf("reply:[T=%d CONI=%d CONT=%d SUCC=%t]",
+		reply.Term, reply.ConflictIndex, reply.ConflictTerm, reply.Success)
 }
 
 func (rf *Raft) sendRequestAppendEntries(server int, args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply) bool {
@@ -67,28 +68,9 @@ func (rf *Raft) searchConflictIndex1(prevLogIndex int) int {
 				rf.me, index, rf.logEntryTerm(index), prevLogIndex, rf.logEntryTerm(prevLogIndex), rf.lastIncludedIndex, rf.lastIncludedTerm)
 			break
 		}
-		LogPrint(DEBUG, dLog, "S%d search conflict index [I=%d T=%d PLI=%d PLT=%d LII=%d LLT=%d]",
-			rf.me, index, rf.logEntryTerm(index), prevLogIndex, rf.logEntryTerm(prevLogIndex), rf.lastIncludedIndex, rf.lastIncludedTerm)
 		index--
 	}
 	return index + 1
-}
-
-func (rf *Raft) searchConflictIndex(lastLogIndex int, prevLogIndex int, prevLogTerm int) int {
-	index := prevLogIndex
-	for {
-		if lastLogIndex < 100 {
-			index = rf.searchConflictIndex1(prevLogIndex)
-		} else {
-			index = rf.searchConflictIndex2(prevLogIndex, rf.logEntryTerm(prevLogIndex))
-		}
-
-		if rf.logEntryTerm(index-1) <= prevLogTerm {
-			break
-		}
-		prevLogIndex = index - 1
-	}
-	return index
 }
 
 func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply) {
@@ -129,8 +111,10 @@ func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *Requ
 		reply.Success = false
 		if nLLIndex < args.PrevLogIndex {
 			reply.ConflictIndex = nLLIndex + 1
+			reply.ConflictTerm = -1
 		} else {
-			reply.ConflictIndex = rf.searchConflictIndex(nLLIndex, args.PrevLogIndex, args.PrevLogTerm)
+			reply.ConflictIndex = rf.searchConflictIndex1(args.PrevLogIndex)
+			reply.ConflictTerm = rf.logEntryTerm(args.PrevLogIndex)
 		}
 		return
 	} else if lenEntries > 0 {
@@ -220,14 +204,13 @@ func (rf *Raft) processAppendEntriesReply(peer int, args *RequestAppendEntriesAr
 
 	LogPrint(INFO, dLeader, "S%d T=%d %s recv append entries res from S%d %s", rf.me, rf.currentTerm, args.str(), peer, reply.str())
 
-	nCurrentTerm := rf.currentTerm
-	if reply.Term > nCurrentTerm {
+	if reply.Term > rf.currentTerm {
 		rf.convertToFollower(reply.Term)
 	}
 
 	if reply.Success {
 
-		if args.Term == nCurrentTerm {
+		if args.Term == rf.currentTerm {
 			matchIndex := args.PrevLogIndex + len(args.Entries)
 			if matchIndex > rf.matchIndex[peer] { // respone reorder
 				rf.matchIndex[peer] = matchIndex
@@ -243,7 +226,7 @@ func (rf *Raft) processAppendEntriesReply(peer int, args *RequestAppendEntriesAr
 			nIndexTerm := -1
 			for i := 0; i < len(rf.matchIndex); i++ {
 				nIndexTerm = rf.log[rf.logArrIndex(nIndex)].Term
-				if i != rf.me && rf.matchIndex[i] > rf.commitIndex && nIndexTerm == nCurrentTerm {
+				if i != rf.me && rf.matchIndex[i] > rf.commitIndex && nIndexTerm == rf.currentTerm {
 					nCount++
 					if rf.matchIndex[i] < nIndex { // the min index for commit
 						nIndex = rf.matchIndex[i]
@@ -261,7 +244,7 @@ func (rf *Raft) processAppendEntriesReply(peer int, args *RequestAppendEntriesAr
 				LogPrint(INFO, dLeader, "S%d recv append entries res from S%d, majority [T=%d CI=%d]",
 					rf.me, peer, args.Term, rf.commitIndex)
 
-				//rf.persist()
+				rf.persist()
 				//rf.sendHeartbeats() // improve execute time, is it need ?
 
 				//rf.matchIndex[rf.me] = rf.commitIndex
@@ -270,9 +253,30 @@ func (rf *Raft) processAppendEntriesReply(peer int, args *RequestAppendEntriesAr
 		}
 	} else {
 		LogPrint(INFO, dLeader, "S%d [T=%d ST=%d] args:[T=%d] recv append entries res from S%d",
-			rf.me, nCurrentTerm, rf.state, args.Term, peer)
-		if args.Term == nCurrentTerm && reply.ConflictIndex < rf.nextIndex[peer] { // reponse reorder
-			rf.nextIndex[peer] = reply.ConflictIndex
+			rf.me, rf.currentTerm, rf.state, args.Term, peer)
+		if args.Term == rf.currentTerm {
+			nextIndex := 1
+			if reply.ConflictTerm == -1 {
+				nextIndex = reply.ConflictIndex
+			} else {
+				conflictIndex := -1
+				for i := args.PrevLogIndex; i > 0; i-- {
+					if rf.logEntryTerm(i) == reply.ConflictTerm {
+						conflictIndex = i
+						break
+					}
+				}
+
+				if conflictIndex != -1 {
+					nextIndex = conflictIndex + 1
+				} else {
+					nextIndex = reply.ConflictIndex
+				}
+			}
+
+			if nextIndex < rf.nextIndex[peer] { // reponse reorder
+				rf.nextIndex[peer] = nextIndex
+			}
 
 			//rf.nextIndex[peer] -= 1
 			//rf.matchIndex[peer] -= 1

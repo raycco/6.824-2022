@@ -131,6 +131,7 @@ func (rf *Raft) persist() {
 	encoder := labgob.NewEncoder(byteBuffer)
 
 	if encoder.Encode(rf.currentTerm) != nil ||
+		encoder.Encode(rf.votedFor) != nil ||
 		//encoder.Encode(rf.lastApplied) != nil ||
 		encoder.Encode(rf.commitIndex) != nil ||
 		encoder.Encode(rf.lastIncludedIndex) != nil ||
@@ -203,11 +204,13 @@ func (rf *Raft) readPersist(data []byte) {
 	decoder := labgob.NewDecoder(byteBuffer)
 
 	var currentTerm int
+	var votedFor int
 	var commitIndex int
 	var lastIncludedIndex int
 	var lastIncludedTerm int
 	var log []LogEntry
 	if decoder.Decode(&currentTerm) != nil ||
+		decoder.Decode(&votedFor) != nil ||
 		//decoder.Decode(&rf.lastApplied) != nil ||
 		decoder.Decode(&commitIndex) != nil ||
 		decoder.Decode(&lastIncludedIndex) != nil ||
@@ -218,6 +221,7 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 
 	rf.currentTerm = currentTerm
+	rf.votedFor = votedFor
 	rf.commitIndex = commitIndex
 	rf.lastIncludedIndex = lastIncludedIndex
 	rf.lastIncludedTerm = lastIncludedTerm
@@ -448,7 +452,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	LogPrint(INFO, dClient, "S%d make raft", rf.me)
 	rf.applyCh = applyCh
 
-	rf.convertToFollower(0)
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 
@@ -465,18 +468,20 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.isNeedApplySnapshot = false
 	rf.isNeedPersistSnapshot = false
 
+	rf.convertToFollower(0)
+
 	rand.New(rand.NewSource(time.Now().UnixNano()))
 	rf.setElectionTimeout()
 	rf.lastElectionTimeout = rf.electionTimeout
 	rf.leaderHeartbeatsTime = time.Now()
-
-	go rf.applier() // before readPersist, may apply snap
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
+
+	go rf.applier()
 
 	return rf
 }
