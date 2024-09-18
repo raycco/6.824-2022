@@ -79,10 +79,10 @@ func (kv *KVServer) processRequest(op Op) OpReply {
 		return opReply
 	}
 
-	if seqid := kv.clientseq[op.ClientId]; seqid != op.SeqId {
+	/*if seqid := kv.clientseq[op.ClientId]; seqid != op.SeqId {
 		delete(kv.ops, seqid)
 		kv.clientseq[op.ClientId] = op.SeqId
-	}
+	}*/
 
 	opCache, ok := kv.ops[op.SeqId]
 	if ok && len(opCache.OpRtn.Err) > 0 {
@@ -199,9 +199,11 @@ func (kv *KVServer) processOp(op Op, index int) {
 
 	term, isLeader := kv.rf.GetState()
 	var opReply OpReply
+
 	opCache, ok := kv.ops[op.SeqId]
 	raft.LogPrint(raft.INFO, dKvServer, "S%d T=%d I=%d Ldr=%t recv apply msg op = %+v cache = %+v",
 		kv.me, term, index, isLeader, op, opCache)
+
 	if ok {
 		if len(opCache.OpRtn.Err) <= 0 {
 			opReply = kv.opExecute(op)
@@ -211,12 +213,13 @@ func (kv *KVServer) processOp(op Op, index int) {
 		}
 	} else {
 		opReply = kv.opExecute(op)
-		if seqid := kv.clientseq[op.ClientId]; seqid != op.SeqId {
-			delete(kv.ops, seqid)
-			kv.clientseq[op.ClientId] = op.SeqId
-		}
 		opCache = &OpCache{term, index, opReply, nil}
 		kv.ops[op.SeqId] = opCache
+	}
+
+	if seqId := kv.clientseq[op.ClientId]; seqId < op.SeqId {
+		delete(kv.ops, seqId)
+		kv.clientseq[op.ClientId] = op.SeqId
 	}
 
 	if isLeader {
@@ -291,18 +294,20 @@ func (kv *KVServer) ingestSnapshot(snapshot []byte, index int) {
 	}
 
 	for _, seqid := range kv.clientseq {
-		opCache, ok1 := ops[seqid]
-		_, ok2 := kv.ops[seqid]
-		if ok1 && !ok2 {
+		opCache, ok := ops[seqid]
+		if ok {
 			kv.ops[seqid] = opCache
 		}
 	}
 	raft.LogPrint(raft.DEBUG, dKvServer, "S%d ingest kv.ops = %+v kv.clientseq = %+v", kv.me, kv.ops, kv.clientseq)
 
-	// apply message may apply one more index after create snapshot
+	// apply message may apply one more index when create snapshot, one index apply two times
+	// 1. current seqid => op was not executed in snapshot
+	// 2. current seqid => op has executed one time in snapshot
 	for lastApplied := lastIncludedIndex + 1; lastApplied <= kv.lastIncludedIndex; lastApplied++ {
-		for _, opCache := range kv.ops {
-			if opCache.Index == lastApplied {
+		for seqid, opCache := range kv.ops {
+			_, ok := ops[seqid]
+			if opCache.Index == lastApplied && !ok {
 				opCache.OpRtn = OpReply{"", ""}
 			}
 		}

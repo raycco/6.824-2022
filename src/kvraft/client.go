@@ -8,6 +8,7 @@ import (
 
 	"6.824/labrpc"
 	"6.824/raft"
+	"6.824/snowflake"
 )
 
 const RetryInterval = 10 * time.Millisecond
@@ -24,7 +25,7 @@ type Clerk struct {
 	clientId     int64
 	leaderId     int
 	currentSeqId int64
-	snowflake    *Snowflake
+	snowflake    *snowflake.Snowflake
 }
 
 func nrand() int64 {
@@ -42,7 +43,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	GlobalClientId++
 	ck.leaderId = 0
 	var err error
-	ck.snowflake, err = NewSnowflake(ck.clientId)
+	ck.snowflake, err = snowflake.NewSnowflake(ck.clientId)
 	if err != nil {
 		panic(err)
 	}
@@ -65,7 +66,7 @@ func (ck *Clerk) processReply(op string, replyCh chan Reply) (string, bool) {
 
 	select {
 	case reply := <-replyCh:
-		raft.LogPrint(raft.INFO, dKvClient, "C%d recv %s response S%d %+v", ck.clientId, op, ck.leaderId, reply)
+		raft.LogPrint(raft.INFO, dKvClient, "C%d recv %s response from S%d %+v", ck.clientId, op, ck.leaderId, reply)
 		if reply.ok {
 			if reply.Err == OK || reply.Err == ErrNoKey {
 				value = reply.Value
@@ -82,7 +83,7 @@ func (ck *Clerk) processReply(op string, replyCh chan Reply) (string, bool) {
 			ck.tryNextSever()
 		}
 	case <-time.After(RequestTimeout):
-		raft.LogPrint(raft.INFO, dKvClient, "C%d recv %s response S%d timeout", ck.clientId, op, ck.leaderId)
+		raft.LogPrint(raft.INFO, dKvClient, "C%d recv %s response from S%d timeout", ck.clientId, op, ck.leaderId)
 		ck.tryNextSever()
 	}
 	return value, ok
