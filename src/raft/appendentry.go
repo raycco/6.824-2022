@@ -223,10 +223,8 @@ func (rf *Raft) processAppendEntriesReply(peer int, args *RequestAppendEntriesAr
 
 			nCount := 1
 			nIndex := rf.matchIndex[peer]
-			nIndexTerm := -1
 			for i := 0; i < len(rf.matchIndex); i++ {
-				nIndexTerm = rf.log[rf.logArrIndex(nIndex)].Term
-				if i != rf.me && rf.matchIndex[i] > rf.commitIndex && nIndexTerm == rf.currentTerm {
+				if i != rf.me && rf.matchIndex[i] > rf.commitIndex {
 					nCount++
 					if rf.matchIndex[i] < nIndex { // the min index for commit
 						nIndex = rf.matchIndex[i]
@@ -234,17 +232,19 @@ func (rf *Raft) processAppendEntriesReply(peer int, args *RequestAppendEntriesAr
 				}
 			}
 
+			nIndexTerm := rf.log[rf.logArrIndex(nIndex)].Term
+
 			LogPrint(INFO, dLeader, "S%d [T=%d MI=%d NI=%d CI=%d LII=%d LIT=%d CNT=%d N=%d NT=%d] recv append entries res from S%d",
 				rf.me, args.Term, rf.matchIndex[peer], rf.nextIndex[peer], rf.commitIndex,
 				rf.lastIncludedIndex, rf.lastIncludedTerm, nCount, nIndex, nIndexTerm, peer)
 
-			if nCount > len(rf.peers)/2 {
+			if nCount > len(rf.peers)/2 && nIndexTerm == rf.currentTerm {
 				rf.commitIndex = nIndex
 
 				LogPrint(INFO, dLeader, "S%d recv append entries res from S%d, majority [T=%d CI=%d]",
 					rf.me, peer, args.Term, rf.commitIndex)
 
-				rf.persist()
+				//rf.persist() // is really need persist commitIndex (TestSpeed3A may fail when run too many test at the same time, CPU 100%) ?
 				//rf.sendHeartbeats() // improve execute time, is it need ?
 
 				//rf.matchIndex[rf.me] = rf.commitIndex
@@ -254,7 +254,16 @@ func (rf *Raft) processAppendEntriesReply(peer int, args *RequestAppendEntriesAr
 	} else {
 		LogPrint(INFO, dLeader, "S%d [T=%d ST=%d] args:[T=%d] recv append entries res from S%d",
 			rf.me, rf.currentTerm, rf.state, args.Term, peer)
-		if args.Term == rf.currentTerm {
+		if args.Term == rf.currentTerm && reply.ConflictIndex < rf.nextIndex[peer] { // reponse reorder
+			rf.nextIndex[peer] = reply.ConflictIndex
+
+			//rf.nextIndex[peer] -= 1
+			//rf.matchIndex[peer] -= 1
+			if rf.state == LEADER && rf.nextIndex[peer] <= rf.lastIncludedIndex {
+				rf.sendInstallSnapshot(peer)
+			}
+		}
+		/*if args.Term == rf.currentTerm {
 			nextIndex := 1
 			if reply.ConflictTerm == -1 {
 				nextIndex = reply.ConflictIndex
@@ -283,7 +292,7 @@ func (rf *Raft) processAppendEntriesReply(peer int, args *RequestAppendEntriesAr
 			if rf.state == LEADER && rf.nextIndex[peer] <= rf.lastIncludedIndex {
 				rf.sendInstallSnapshot(peer)
 			}
-		}
+		}*/
 	}
 
 	if rf.commitIndex > rf.lastApplied {

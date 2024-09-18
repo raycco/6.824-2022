@@ -74,8 +74,7 @@ type Raft struct {
 	nextIndex  []int // for each server, index of the next log entry to send to that server (initialized to leader last log index + 1)
 	matchIndex []int // for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
 
-	electionTimeout     time.Duration // election timeout, also follower heartbeats timeout
-	lastElectionTimeout time.Duration
+	electionTimeout time.Duration // election timeout, also follower heartbeats timeout
 
 	electionTime         time.Time
 	leaderHeartbeatsTime time.Time
@@ -231,7 +230,6 @@ func (rf *Raft) readPersist(data []byte) {
 	rf.lastSnapshot = rf.persister.ReadSnapshot()
 	if len(rf.lastSnapshot) > 0 {
 		rf.isNeedApplySnapshot = true
-
 	} else {
 		rf.lastIncludedIndex = 0
 		rf.lastIncludedTerm = -1
@@ -370,7 +368,7 @@ func (rf *Raft) applier() {
 			rf.mu.Unlock()
 			rf.applyCh <- msg // may block, goroutine can not ensure sequence
 			rf.mu.Lock()
-		} else if rf.commitIndex > rf.lastApplied {
+		} else if rf.commitIndex > rf.lastApplied && rf.lastLogIndex() > rf.lastApplied {
 			rf.lastApplied++
 			command := rf.log[rf.logArrIndex(rf.lastApplied)].Command
 			msg := ApplyMsg{true, command, rf.lastApplied, false, nil, 0, 0}
@@ -472,7 +470,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rand.New(rand.NewSource(time.Now().UnixNano()))
 	rf.setElectionTimeout()
-	rf.lastElectionTimeout = rf.electionTimeout
 	rf.leaderHeartbeatsTime = time.Now()
 
 	// initialize from state persisted before a crash
