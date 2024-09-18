@@ -1,5 +1,11 @@
 package shardctrler
 
+import (
+	"sort"
+
+	"6.824/raft"
+)
+
 //
 // Shard controler: assigns shards to replication groups.
 //
@@ -29,13 +35,27 @@ type Config struct {
 }
 
 const (
-	OK = "OK"
+	OK             = "OK"
+	ErrWrongLeader = "ErrWrongLeader"
 )
 
 type Err string
 
+const (
+	dScServer raft.LogTopic = "SCSR"
+	dScClient raft.LogTopic = "SCCL"
+)
+
+type CommonArgs struct {
+	ClientId int64
+	SeqId    int64
+}
+
 type JoinArgs struct {
 	Servers map[int][]string // new GID -> servers mappings
+
+	ClientId int64
+	SeqId    int64
 }
 
 type JoinReply struct {
@@ -45,6 +65,9 @@ type JoinReply struct {
 
 type LeaveArgs struct {
 	GIDs []int
+
+	ClientId int64
+	SeqId    int64
 }
 
 type LeaveReply struct {
@@ -55,6 +78,9 @@ type LeaveReply struct {
 type MoveArgs struct {
 	Shard int
 	GID   int
+
+	ClientId int64
+	SeqId    int64
 }
 
 type MoveReply struct {
@@ -64,10 +90,42 @@ type MoveReply struct {
 
 type QueryArgs struct {
 	Num int // desired config number
+
+	ClientId int64
+	SeqId    int64
 }
 
 type QueryReply struct {
 	WrongLeader bool
 	Err         Err
 	Config      Config
+}
+
+type Reply struct {
+	WrongLeader bool
+	Err         Err
+	Config      Config
+}
+
+type GidShards struct {
+	gid    int
+	shards []int
+}
+
+func createGidShardsArr(gidShardsMap map[int][]int) []GidShards {
+	gidShardsArr := make([]GidShards, 0)
+	for gid, shardids := range gidShardsMap {
+		sort.Ints(shardids)
+		gidShardsArr = append(gidShardsArr, GidShards{gid, shardids})
+	}
+	return gidShardsArr
+}
+
+func sortGidShardsArray(gidshards []GidShards) {
+	sort.SliceStable(gidshards, func(i, j int) bool {
+		if len(gidshards[i].shards) == len(gidshards[j].shards) {
+			return gidshards[i].gid < gidshards[j].gid
+		}
+		return len(gidshards[i].shards) < len(gidshards[j].shards)
+	})
 }
