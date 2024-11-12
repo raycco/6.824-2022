@@ -302,12 +302,12 @@ func (kv *KVServer) ingestSnapshot(snapshot []byte, index int) {
 	raft.LogPrint(raft.DEBUG, dKvServer, "S%d ingest kv.ops = %+v kv.clientseq = %+v", kv.me, kv.ops, kv.clientseq)
 
 	// apply message may apply one more index when create snapshot, one index apply two times
-	// 1. current seqid => op was not executed in snapshot
-	// 2. current seqid => op has executed one time in snapshot
+	// 1. current seqid => op has not executed in snapshot, the first time execute may not write to db
+	// 2. current seqid => op has executed one time in snapshot, so no need to execute second time
 	for lastApplied := lastIncludedIndex + 1; lastApplied <= kv.lastIncludedIndex; lastApplied++ {
 		for seqid, opCache := range kv.ops {
 			_, ok := ops[seqid]
-			if opCache.Index == lastApplied && !ok {
+			if !ok {
 				opCache.OpRtn = OpReply{"", ""}
 			}
 		}

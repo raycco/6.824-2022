@@ -11,8 +11,9 @@ import (
 	"6.824/snowflake"
 )
 
-const RetryInterval = 10 * time.Millisecond
-const RequestTimeout = 4000 * time.Millisecond
+const SwitchSvrInterval = 20 * time.Millisecond
+const RequestTimeout = 3000 * time.Millisecond
+const RetryCount = 3
 
 var GlobalClientId int64 = 0
 var GlobalSeqId int64 = 1
@@ -26,6 +27,9 @@ type Clerk struct {
 	leaderId     int
 	currentSeqId int64
 	snowflake    *snowflake.Snowflake
+
+	retryCount int
+	replyCh    chan Reply
 }
 
 func nrand() int64 {
@@ -52,21 +56,24 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck.currentSeqId = GlobalSeqId
 	GlobalSeqId++
 	mu.Unlock()*/
+	ck.retryCount = 1
+	ck.replyCh = make(chan Reply)
 	return ck
 }
 
 func (ck *Clerk) tryNextSever() {
 	ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
-	time.Sleep(RetryInterval)
+	time.Sleep(SwitchSvrInterval)
 }
 
-func (ck *Clerk) processReply(op string, replyCh chan Reply) (string, bool) {
+func (ck *Clerk) processReply(op string) (string, bool) {
 	value := ""
 	ok := false
 
 	select {
-	case reply := <-replyCh:
+	case reply := <-ck.replyCh:
 		raft.LogPrint(raft.INFO, dKvClient, "C%d recv %s response from S%d %+v", ck.clientId, op, ck.leaderId, reply)
+		ck.retryCount = 1
 		if reply.ok {
 			if reply.Err == OK || reply.Err == ErrNoKey {
 				value = reply.Value
@@ -85,6 +92,12 @@ func (ck *Clerk) processReply(op string, replyCh chan Reply) (string, bool) {
 	case <-time.After(RequestTimeout):
 		raft.LogPrint(raft.INFO, dKvClient, "C%d recv %s response from S%d timeout", ck.clientId, op, ck.leaderId)
 		ck.tryNextSever()
+		/*if ck.retryCount > RetryCount {
+			ck.tryNextSever()
+			ck.retryCount = 1
+		} else {
+			ck.retryCount++
+		}*/
 	}
 	return value, ok
 }
@@ -108,18 +121,16 @@ func (ck *Clerk) Get(key string) string {
 		var value string
 		args := GetArgs{key, ck.clientId, ck.currentSeqId}
 
-		replyCh := make(chan Reply)
-
 		for {
 			go func(peer int, args *GetArgs) {
 				raft.LogPrint(raft.INFO, dKvClient, "C%d send Get request S%d %+v", ck.clientId, peer, args)
 				var reply GetReply
 				ok := ck.servers[peer].Call("KVServer.Get", args, &reply)
-				replyCh <- Reply{ok, reply.Err, reply.Value}
+				ck.replyCh <- Reply{ok, reply.Err, reply.Value}
 			}(ck.leaderId, &args)
 
 			var ok bool
-			value, ok = ck.processReply("Get", replyCh)
+			value, ok = ck.processReply("Get")
 			if ok {
 				break
 			}
@@ -144,7 +155,6 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	defer ck.mu.Unlock()
 
 	args := PutAppendArgs{key, value, op, ck.clientId, ck.currentSeqId}
-	replyCh := make(chan Reply)
 
 	for {
 
@@ -167,11 +177,11 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 			raft.LogPrint(raft.INFO, dKvClient, "C%d send Put/Append request S%d %+v", ck.clientId, peer, args)
 			var reply PutAppendReply
 			ok := ck.servers[peer].Call("KVServer.PutAppend", args, &reply)
-			replyCh <- Reply{ok, reply.Err, ""}
+			ck.replyCh <- Reply{ok, reply.Err, ""}
 		}(ck.leaderId, &args)
 
 		var ok bool
-		_, ok = ck.processReply("Put/Append", replyCh)
+		_, ok = ck.processReply("Put/Append")
 		if ok {
 			break
 		}
