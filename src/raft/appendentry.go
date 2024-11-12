@@ -63,6 +63,7 @@ func (rf *Raft) searchConflictIndex2(endIndex int, targetTerm int) int {
 func (rf *Raft) searchConflictIndex1(prevLogIndex int) int {
 	index := prevLogIndex - 1
 	for {
+		// index <= 1, be careful endless loop
 		if rf.logEntryTerm(prevLogIndex) != rf.logEntryTerm(index) || index <= LogStartIndex {
 			LogPrint(INFO, dLog, "S%d search conflict index [I=%d T=%d PLI=%d PLT=%d LII=%d LLT=%d]",
 				rf.me, index, rf.logEntryTerm(index), prevLogIndex, rf.logEntryTerm(prevLogIndex), rf.lastIncludedIndex, rf.lastIncludedTerm)
@@ -84,10 +85,12 @@ func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *Requ
 
 	nCurrentTerm := rf.currentTerm
 
+	// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower (§5.1)
 	if args.Term > nCurrentTerm { // leader term > my term => follower
 		rf.convertToFollower(args.Term)
 	}
 
+	// 1. Reply false if term < currentTerm (§5.1)
 	if args.Term < nCurrentTerm { // leader term < my term, reject
 		reply.Term = rf.currentTerm
 		reply.Success = false
@@ -96,15 +99,20 @@ func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *Requ
 
 	rf.resetElectionTimeout()
 
+	// in lab 3, create snapshot by log size, so each server's lastIncludedIndex may different
+	// when args.PrevLogIndex < rf.lastIncludedIndex need reply false
 	if args.PrevLogIndex < rf.lastIncludedIndex {
 		reply.Term = rf.currentTerm
-		reply.Success = true
+		reply.Success = false
+		reply.ConflictIndex = rf.lastIncludedIndex + 1
 		return
 	}
 
 	isNeedPersist := false
 	lenEntries := len(args.Entries)
 
+	// 2. Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm (§5.3)
+	// last log index < PrevLogIndex, same
 	nLLIndex := rf.lastLogIndex()
 	if nLLIndex < args.PrevLogIndex || rf.logEntryTerm(args.PrevLogIndex) != args.PrevLogTerm {
 		reply.Term = rf.currentTerm
@@ -120,6 +128,8 @@ func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *Requ
 	} else if lenEntries > 0 {
 		//LogPrint(INFO, dLog, "S%d log size=%d log %s entries %s", rf.me, logEntryByteSize(rf.log), logStr(rf.log), logStr(args.Entries))
 
+		// 3. If an existing entry conflicts with a new one (same index but different terms),
+		// delete the existing entry and all that follow it (§5.3)
 		index := args.PrevLogIndex + 1
 		for i := 0; i < lenEntries && index <= nLLIndex; i++ {
 			arrIndex := rf.logArrIndex(index)
@@ -133,6 +143,7 @@ func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *Requ
 		}
 		conflictIndex := index - (args.PrevLogIndex + 1)
 		LogPrint(INFO, dLog, "S%d index=%d conflictIndex=%d log size=%d", rf.me, index, conflictIndex, logEntryByteSize(rf.log))
+		// 4. Append any new entries not already in the log
 		if conflictIndex < lenEntries {
 			LogPrint(DEBUG, dLog, "S%d log %v entries %v", rf.me, rf.log, args.Entries) // logStr cost time result to TestSpeed3A failed
 			rf.log = append(rf.log, args.Entries[conflictIndex:]...)
@@ -142,6 +153,7 @@ func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *Requ
 		//LogPrint(INFO, dLog, "S%d log size %d log %s", rf.me, logEntryByteSize(rf.log), logStr(rf.log))
 	}
 
+	// 5. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
 	if args.LeaderCommit > rf.commitIndex {
 		if args.LeaderCommit < rf.lastLogIndex() {
 			rf.commitIndex = args.LeaderCommit
@@ -155,8 +167,9 @@ func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *Requ
 		rf.persist()
 	}
 
+	// If commitIndex > lastApplied: increment lastApplied, apply log[lastApplied] to state machine (§5.3)
 	if rf.commitIndex > rf.lastApplied {
-		rf.applyCond.Broadcast()
+		rf.applyCond.Signal()
 	}
 
 	reply.Term = rf.currentTerm
@@ -170,6 +183,7 @@ func (rf *Raft) prepareAppendEntriesArgs(peer int, heartbeats bool) *RequestAppe
 
 	//prevLogIndex := rf.matchIndex[peer]
 
+	// rf.nextIndex[peer] >= 1
 	if rf.nextIndex[peer] <= rf.lastIncludedIndex {
 		rf.nextIndex[peer] = rf.lastIncludedIndex + 1
 	}
@@ -204,23 +218,27 @@ func (rf *Raft) processAppendEntriesReply(peer int, args *RequestAppendEntriesAr
 
 	LogPrint(INFO, dLeader, "S%d T=%d %s recv append entries res from S%d %s", rf.me, rf.currentTerm, args.str(), peer, reply.str())
 
+	// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower (§5.1)
 	if reply.Term > rf.currentTerm {
 		rf.convertToFollower(reply.Term)
+		return
 	}
 
 	if reply.Success {
 
 		if args.Term == rf.currentTerm {
 			matchIndex := args.PrevLogIndex + len(args.Entries)
-			if matchIndex > rf.matchIndex[peer] { // respone reorder
+			if matchIndex > rf.matchIndex[peer] { // response reorder
 				rf.matchIndex[peer] = matchIndex
 			}
 
 			nextIndex := matchIndex + 1
-			if nextIndex > rf.nextIndex[peer] { // respone reorder
+			if nextIndex > rf.nextIndex[peer] { // response reorder
 				rf.nextIndex[peer] = nextIndex
 			}
 
+			// If there exists an N such that N > commitIndex, a majority of matchIndex[i] ≥ N,
+			// and log[N].term == currentTerm: set commitIndex = N (§5.3, §5.4).
 			nCount := 1
 			nIndex := rf.matchIndex[peer]
 			for i := 0; i < len(rf.matchIndex); i++ {
@@ -244,7 +262,9 @@ func (rf *Raft) processAppendEntriesReply(peer int, args *RequestAppendEntriesAr
 				LogPrint(INFO, dLeader, "S%d recv append entries res from S%d, majority [T=%d CI=%d]",
 					rf.me, peer, args.Term, rf.commitIndex)
 
-				//rf.persist() // is really need persist commitIndex (TestSpeed3A may fail when run too many test at the same time, CPU 100%) ?
+				// If commitIndex > lastApplied: increment lastApplied, apply log[lastApplied] to state machine (§5.3)
+				// the leader applies the entry to its state machine
+				rf.persist()
 				//rf.sendHeartbeats() // improve execute time, is it need ?
 
 				//rf.matchIndex[rf.me] = rf.commitIndex
@@ -254,11 +274,19 @@ func (rf *Raft) processAppendEntriesReply(peer int, args *RequestAppendEntriesAr
 	} else {
 		LogPrint(INFO, dLeader, "S%d [T=%d ST=%d] args:[T=%d] recv append entries res from S%d",
 			rf.me, rf.currentTerm, rf.state, args.Term, peer)
-		if args.Term == rf.currentTerm && reply.ConflictIndex < rf.nextIndex[peer] { // reponse reorder
+		// in lab 3, create snapshot by log size, so each server's lastIncludedIndex may different
+		// when args.PrevLogIndex < rf.lastIncludedIndex need reply false
+		// Leader may always send same PrevLogIndex to Follower, endless loop then log can not commit
+		if args.Term == rf.currentTerm &&
+			(reply.ConflictIndex < rf.nextIndex[peer] || // response reorder
+				(rf.lastIncludedIndex > 0 && rf.lastIncludedIndex < reply.ConflictIndex)) { // todo
 			rf.nextIndex[peer] = reply.ConflictIndex
 
 			//rf.nextIndex[peer] -= 1
 			//rf.matchIndex[peer] -= 1
+
+			// the leader must occasionally send snapshots to followers that lag behind. This happens when the leader
+			// has already discarded the next log entry that it needs to send to a follower.
 			if rf.state == LEADER && rf.nextIndex[peer] <= rf.lastIncludedIndex {
 				rf.sendInstallSnapshot(peer)
 			}
@@ -295,8 +323,10 @@ func (rf *Raft) processAppendEntriesReply(peer int, args *RequestAppendEntriesAr
 		}*/
 	}
 
+	// If commitIndex > lastApplied: increment lastApplied, apply log[lastApplied] to state machine (§5.3)
+	// the leader returns the result of that execution to the client
 	if rf.commitIndex > rf.lastApplied {
-		rf.applyCond.Broadcast()
+		rf.applyCond.Signal()
 	}
 }
 

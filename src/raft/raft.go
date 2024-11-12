@@ -235,7 +235,7 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.lastIncludedTerm = -1
 	}
 	rf.lastApplied = rf.lastIncludedIndex
-	rf.applyCond.Broadcast()
+	rf.applyCond.Signal()
 
 	LogPrint(INFO, dPersist, "S%d read raft state lastApplied=%d CI=%d LII=%d LIT=%d log %v",
 		rf.me, rf.lastApplied, rf.commitIndex, rf.lastIncludedIndex, rf.lastIncludedTerm, rf.log)
@@ -264,7 +264,8 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		return
 	}
 
-	if index > rf.commitIndex || index < rf.lastIncludedIndex {
+	if index > rf.commitIndex || index <= rf.lastIncludedIndex {
+		// may receive snapshot from leader, so maybe index == rf.lastIncludedIndex, must add condition equal
 		LogPrint(ERROR, dSnap, "S%d snapshot index error index=%d CI=%d LII=%d", rf.me, index, rf.commitIndex, rf.lastIncludedIndex)
 		return
 	}
@@ -285,7 +286,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 	rf.isNeedApplySnapshot = true
 	rf.lastApplied = rf.lastIncludedIndex
-	rf.applyCond.Broadcast()
+	rf.applyCond.Signal()
 
 	LogPrint(INFO, dSnap, "S%d snapshot LII=%d LIT=%d, trimed log %v", rf.me, rf.lastIncludedIndex, rf.lastIncludedTerm, rf.log)
 }
@@ -322,7 +323,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		isLeader = false
 	}
 
-	rf.persist()
+	// rf.persist() // cost time, Start() should return immediately, without waiting for the log appends to complete
 
 	index = rf.lastLogIndex()
 	term = rf.currentTerm
@@ -342,10 +343,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
-	rf.mu.Lock()
-	rf.persist()
+	//rf.mu.Lock()
+	//.persist() // after kill, the tester will not copy the new persist data
 	LogPrint(INFO, dInfo, "S%d killed", rf.me)
-	rf.mu.Unlock()
+	//rf.mu.Unlock()
 }
 
 func (rf *Raft) killed() bool {

@@ -28,6 +28,7 @@ func (rf *Raft) sendRequestInstallSnapshot(server int, args *InstallSnapshotArgs
 
 func (rf *Raft) trimLog(index int) {
 	var log []LogEntry
+	log = make([]LogEntry, 0)
 	log = append(log, rf.log[0])
 	trimIndex := rf.logArrIndex(index + 1)
 	if trimIndex < len(rf.log) {
@@ -40,13 +41,13 @@ func (rf *Raft) RequestInstallSnapshot(args *InstallSnapshotArgs, reply *Install
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	nTerm := rf.currentTerm
+	nCurrentTerm := rf.currentTerm
 
-	if args.Term > nTerm { // leader term > my term => follower
+	if args.Term > nCurrentTerm { // leader term > my term => follower
 		rf.convertToFollower(args.Term)
 	}
 
-	if args.Term < nTerm { // leader term < my term, reject
+	if args.Term < nCurrentTerm { // leader term < my term, reject
 		reply.Term = rf.currentTerm
 		return // if the term in the AppendEntries arguments is outdated, you should not reset your timer
 	}
@@ -74,7 +75,7 @@ func (rf *Raft) RequestInstallSnapshot(args *InstallSnapshotArgs, reply *Install
 			rf.persist()
 
 			rf.isNeedApplySnapshot = true
-			rf.applyCond.Broadcast()
+			rf.applyCond.Signal()
 		} else {
 			if rf.lastIncludedTerm == args.LastIncludedTerm {
 

@@ -59,10 +59,27 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	reply.Term = nCurrentTerm
 
+	// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower (§5.1)
 	if args.Term > nCurrentTerm {
-		rf.convertToFollower(args.Term)
+		rf.convertToFollower(args.Term) // must reset voteFor
 	}
 
+	/************************************************************
+	if args.Term < nCurrentTerm
+		003200 INFO TIMR S1 timeout, start next election
+		003206 INFO VOTE S1 args:[T=1 LLI=0 LLT=-1] send vote req to S2
+		003208 INFO TIMR S2 timeout, start next election
+		003209 INFO VOTE S2 args:[T=1 LLI=0 LLT=-1] send vote req to S1
+		003210 INFO VOTE S1 args:[T=1 LLI=0 LLT=-1] send vote req to S0
+		003215 INFO VOTE S0 [T=0 VF=-1 LLI=0 LLT=-1 ST=0 CI=0] recv vote req from S1 args:[T=1 LLI=0 LLT=-1]
+		003218 INFO VOTE S2 args:[T=1 LLI=0 LLT=-1] send vote req to S0
+		003221 INFO VOTE S2 [T=1 VF=2 LLI=0 LLT=-1 ST=1 CI=0] recv vote req from S1 args:[T=1 LLI=0 LLT=-1]
+		003223 INFO VOTE S1 [T=1 CNT=1] args:[T=1] recv vote res from S0 reply:[T=0 GRANT=true]
+		003224 INFO LEAD S1 victory at T1, become leader
+		003230 INFO VOTE S1 [T=1 VF=-1 LLI=0 LLT=-1 ST=2 CI=0] recv vote req from S2 args:[T=1 LLI=0 LLT=-1]
+		003234 INFO VOTE S2 [T=1 CNT=1] args:[T=1] recv vote res from S1 reply:[T=1 GRANT=true]
+		003234 INFO LEAD S2 victory at T1, become leader
+	***************************************************************/
 	if args.Term <= nCurrentTerm || (rf.votedFor != -1 && args.CandidateId != rf.votedFor) {
 		reply.VoteGranted = false
 		return
@@ -111,6 +128,8 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 }
 
 func (rf *Raft) convertToFollower(term int) {
+	// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower (§5.1)
+	// voteFor must reset
 	rf.state = FOLLOWER
 	rf.currentTerm = term
 	rf.votedFor = -1
@@ -169,6 +188,7 @@ func (rf *Raft) startElection() {
 					LogPrint(INFO, dVote, "S%d [T=%d CNT=%d] args:[T=%d] recv vote res from S%d %s\n",
 						rf.me, rf.currentTerm, nVoteCount, args.Term, server, reply.str())
 
+					// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower (§5.1)
 					if reply.Term > rf.currentTerm {
 						rf.convertToFollower(reply.Term)
 					}
