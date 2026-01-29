@@ -205,6 +205,8 @@ func (sc *ShardCtrler) applier() {
 			opCache = &OpCache{term, index, op.Opcode, seqid}
 		}
 
+		sc.clientop[clientid] = opCache
+
 		if isLeader {
 			if replyCh, ok := sc.replyChs[index]; ok && replyCh != nil {
 				sc.mu.Unlock()
@@ -307,6 +309,7 @@ func (sc *ShardCtrler) assignShardsJoin(joingids []int, shards [NShards]int) [NS
 
 	for _, ngid := range joingids {
 
+		// gid => shardids
 		gidShardsMap := make(map[int][]int)
 		for shard, gid := range shards {
 			if gid > 0 {
@@ -314,6 +317,7 @@ func (sc *ShardCtrler) assignShardsJoin(joingids []int, shards [NShards]int) [NS
 			}
 		}
 
+		// shards empty, first gid assign to every shard
 		if len(gidShardsMap) == 0 {
 			for i := 0; i < NShards; i++ {
 				shards[i] = ngid
@@ -321,15 +325,18 @@ func (sc *ShardCtrler) assignShardsJoin(joingids []int, shards [NShards]int) [NS
 			continue
 		}
 
+		// new join gid
 		gidShardsMap[ngid] = make([]int, 0)
 
 		groupCount := len(gidShardsMap)
-		if NShards/groupCount < 1 {
+		if NShards/groupCount < 1 { // one gid => one shard
 			break
 		}
 
+		//gid shards map => gid shards array
 		gidShardsArr := createGidShardsArr(gidShardsMap)
 
+		// gid shards array sort by shards count, take shard id from max shard count group to min shard count group
 		last := groupCount - 1
 		first := 0
 		for {
@@ -340,12 +347,13 @@ func (sc *ShardCtrler) assignShardsJoin(joingids []int, shards [NShards]int) [NS
 			if maxShardCount-minShardCount > 1 {
 				shardid := gidShardsArr[last].shards[0]
 				gidShardsArr[last].shards = append(gidShardsArr[last].shards[:0], gidShardsArr[last].shards[1:]...)
-				gidShardsArr[0].shards = append(gidShardsArr[0].shards, shardid)
+				gidShardsArr[first].shards = append(gidShardsArr[first].shards, shardid)
 			} else {
 				break
 			}
 		}
 
+		//gid shards array => shards array
 		for _, gidshard := range gidShardsArr {
 			for _, shardid := range gidshard.shards {
 				shards[shardid] = gidshard.gid
@@ -385,12 +393,14 @@ func (sc *ShardCtrler) assignShardsLeave(leavegids []int, shards [NShards]int, r
 
 	for _, leavegid := range leavegids {
 
+		// gid => shardids
 		gidShardsMap := make(map[int][]int)
 		for shard, gid := range shards {
 			gidShardsMap[gid] = append(gidShardsMap[gid], shard)
 		}
 
 		newGroupCount := len(gidShardsMap) - 1
+		// no group id => shard
 		if newGroupCount == 0 {
 			for i := 0; i < NShards; i++ {
 				shards[i] = 0
@@ -408,6 +418,7 @@ func (sc *ShardCtrler) assignShardsLeave(leavegids []int, shards [NShards]int, r
 		sortGidShardsArray(gidShardsArr)
 
 		if len(remaingids) >= NShards {
+			// remaining group ids >= NShards, search one group id while not assign before directly assign
 			for _, rgid := range remaingids {
 				_, ok := gidShardsMap[rgid]
 				if !ok {
@@ -420,7 +431,7 @@ func (sc *ShardCtrler) assignShardsLeave(leavegids []int, shards [NShards]int, r
 					break
 				}
 			}
-		} else if shardsPerGroup > 0 {
+		} else if shardsPerGroup > 0 { // leave group id in shards array, so average assign to remain group
 			for i := 0; i < len(gidShardsArr); i++ {
 				shardids := make([]int, shardsPerGroup)
 				copy(shardids, shardsToAssign[:shardsPerGroup])
@@ -429,10 +440,12 @@ func (sc *ShardCtrler) assignShardsLeave(leavegids []int, shards [NShards]int, r
 			}
 		}
 
+		// shardsPerGroup = 0, average assign one group to remain group
 		for i, shardid := range shardsToAssign {
 			gidShardsArr[i].shards = append(gidShardsArr[i].shards, shardid)
 		}
 
+		//gid shards array => shards array
 		for _, gidshard := range gidShardsArr {
 			for _, shardid := range gidshard.shards {
 				shards[shardid] = gidshard.gid

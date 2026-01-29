@@ -142,7 +142,6 @@ func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *Requ
 			index += 1
 		}
 		conflictIndex := index - (args.PrevLogIndex + 1)
-		LogPrint(INFO, dLog, "S%d index=%d conflictIndex=%d log size=%d", rf.me, index, conflictIndex, logEntryByteSize(rf.log))
 		// 4. Append any new entries not already in the log
 		if conflictIndex < lenEntries {
 			LogPrint(DEBUG, dLog, "S%d log %v entries %v", rf.me, rf.log, args.Entries) // logStr cost time result to TestSpeed3A failed
