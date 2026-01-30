@@ -12,10 +12,12 @@ import "6.824/raft"
 //
 
 const (
-	OK             = "OK"
-	ErrNoKey       = "ErrNoKey"
-	ErrWrongGroup  = "ErrWrongGroup"
-	ErrWrongLeader = "ErrWrongLeader"
+	OK               = "OK"
+	ErrNoKey         = "ErrNoKey"
+	ErrWrongGroup    = "ErrWrongGroup"
+	ErrWrongLeader   = "ErrWrongLeader"
+	ErrWrongMigrate  = "ErrWrongMigrate"
+	ErrWaitCfgChange = "ErrWaitCfgChange"
 )
 
 const (
@@ -52,4 +54,22 @@ type GetArgs struct {
 type GetReply struct {
 	Err   Err
 	Value string
+}
+
+func containsKey(slice []string, key string) bool {
+	for _, v := range slice {
+		if v == key {
+			return true
+		}
+	}
+	return false
+}
+
+func removeKey(slice []string, key string) []string {
+	for i, v := range slice {
+		if v == key {
+			return append(slice[:i], slice[i+1:]...)
+		}
+	}
+	return slice
 }
