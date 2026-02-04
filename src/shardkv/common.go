@@ -25,6 +25,17 @@ const (
 	dKvClient raft.LogTopic = "KVCL"
 )
 
+type State int
+
+const (
+	ACTIVING  State = 0x01
+	CONFIGING State = 0x02
+	SERVING   State = 0x04
+	WAITING   State = 0x08
+	MIGRATING State = 0x10
+	DELETING  State = 0x20
+)
+
 type Err string
 
 // Put or Append

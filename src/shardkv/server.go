@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"6.824/labgob"
 	"6.824/labrpc"
@@ -18,7 +17,13 @@ const (
 	OP_PUT     = 2
 	OP_APPEND  = 3
 	OP_MIGRATE = 4
+	OP_CONFIG  = 5
 )
+
+type KeyVal struct {
+	Key   string
+	Value string
+}
 
 type Op struct {
 	// Your definitions here.
@@ -27,9 +32,7 @@ type Op struct {
 	Opcode   int
 	ClientId int64
 	SeqId    int64
-	Key      string
-	Value    string
-	Cfg      interface{}
+	Type     interface{}
 }
 
 type OpReply struct {
@@ -58,31 +61,32 @@ type ShardKV struct {
 	// Your definitions here.
 	dead     int32
 	database map[string]string
+	dbstat   DbStat
 
-	cfgck  *shardctrler.Clerk
-	config shardctrler.Config
+	cfgck      *shardctrler.Clerk
+	config     Cfg
+	lastConfig Cfg
 
 	clientop map[int64]*OpCache   // client id -> last op
 	replyChs map[int]chan OpReply // index -> reply channel
 
 	lastIncludedIndex int
 	lastRaftStateSize int
+	migrateStat       map[int]bool
 
 	migrateCond  *sync.Cond
 	migrateCond1 *sync.Cond
 	migrateCh    chan int
 	migratingDb  map[string]string
 
-	migratingGidConfig map[int]shardctrler.Config
+	migratingGidConfig map[int]Cfg
 
 	migratingCond *sync.Cond
 	cfgUpdateCond *sync.Cond
 
 	waitPushCount map[int]int // wait push count for each config version
 
-	pushed bool
-	pulled bool
-	state  int
+	state State
 
 	lastPushSeqId int64
 	lastPullSeqId int64
@@ -95,7 +99,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
-	op := Op{OP_GET, args.ClientId, args.SeqId, args.Key, "", nil}
+	op := Op{OP_GET, args.ClientId, args.SeqId, KeyVal{args.Key, ""}}
 	raft.LogPrint(raft.INFO, dKvServer, "%s recv Get request from C%d op=%+v", kv.logPrefix, args.ClientId, op)
 
 	opReply := kv.processRequest(op)
@@ -110,7 +114,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
-	op := Op{-1, args.ClientId, args.SeqId, args.Key, args.Value, nil}
+	op := Op{-1, args.ClientId, args.SeqId, KeyVal{args.Key, args.Value}}
 	if args.Op == "Put" {
 		op.Opcode = OP_PUT
 	} else {
@@ -171,7 +175,9 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(Op{})
-	labgob.Register(shardctrler.Config{})
+	labgob.Register(Cfg{})
+	labgob.Register(Migrate{})
+	labgob.Register(KeyVal{})
 
 	kv := new(ShardKV)
 	kv.me = me
@@ -200,22 +206,28 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 
 	kv.lastIncludedIndex = 0
 	kv.lastRaftStateSize = kv.rf.GetRaftStateSize()
+	kv.migrateStat = make(map[int]bool)
+	kv.migrateStat[0] = true
 
 	kv.migratingDb = make(map[string]string)
-	kv.migratingGidConfig = make(map[int]shardctrler.Config)
+	kv.migratingGidConfig = make(map[int]Cfg)
 	kv.state = SERVING
-
-	go kv.applier()
-
-	go kv.ticker()
 
 	kv.migrateCond = sync.NewCond(&kv.mu)
 	kv.migrateCond1 = sync.NewCond(&kv.mu)
 	kv.migratingCond = sync.NewCond(&kv.mu)
 	kv.cfgUpdateCond = sync.NewCond(&kv.mu)
-	kv.migrateCh = make(chan int)
-
 	kv.waitPushCount = make(map[int]int)
+
+	kv.dbstat = DbStat{0, SERVING, true, "", "", nil, nil}
+
+	go kv.applier()
+
+	go kv.configer()
+
+	//go kv.migrater()
+
+	kv.migrateCh = make(chan int)
 
 	kv.lastPushSeqId = 0
 	kv.lastPullSeqId = 0
@@ -227,8 +239,8 @@ func (kv *ShardKV) waitForMigrate(shard int, clientid int64, key string) {
 	for {
 		wait := false
 		if kv.config.Num > 1 {
-			lastCfg := kv.cfgck.Query(kv.config.Num - 1)
-			gid := lastCfg.Shards[shard]
+			//lastCfg := kv.cfgck.Query(kv.config.Num - 1)
+			gid := kv.lastConfig.Shards[shard]
 			if kv.state == MIGRATING && len(kv.migratingGidConfig) > 0 {
 				_, ok := kv.migratingGidConfig[gid]
 				_, exist := kv.migratingDb[key]
@@ -238,7 +250,7 @@ func (kv *ShardKV) waitForMigrate(shard int, clientid int64, key string) {
 			}
 		}
 
-		if kv.state != WAIT && (clientid == PUSH_CLIENT_ID || !wait) {
+		if clientid == MIGRATE_CLIENT_ID || (kv.state != WAITING && !wait) {
 			break
 		}
 		kv.migratingCond.Wait()
@@ -249,25 +261,28 @@ func (kv *ShardKV) processRequest(op Op) OpReply {
 
 	raft.LogPrint(raft.INFO, dKvServer, "%s process request config num = %d, op %+v",
 		kv.logPrefix, kv.config.Num, op)
-	shard := key2shard(op.Key)
+
+	key := op.Type.(KeyVal).Key
+
+	shard := key2shard(key)
 	gid := kv.config.Shards[shard]
 	if gid != kv.gid {
 		return OpReply{ErrWrongGroup, ""}
 	}
-
-	kv.waitForMigrate(shard, op.ClientId, op.Key)
 
 	_, isLeader := kv.rf.GetState()
 	if !isLeader {
 		return OpReply{ErrWrongLeader, ""}
 	}
 
-	/*if op.Opcode != OP_GET {
+	kv.waitForMigrate(shard, op.ClientId, key)
+
+	if op.Opcode != OP_GET {
 		opCache, ok := kv.clientop[op.ClientId]
 		if ok && op.SeqId < opCache.SeqId {
 			return OpReply{OK, ""}
 		}
-	}*/
+	}
 
 	index, term, isleader := kv.rf.Start(op)
 	if !isleader {
@@ -290,7 +305,10 @@ func (kv *ShardKV) processRequest(op Op) OpReply {
 func (kv *ShardKV) opExecute(op Op) OpReply {
 	var opReply OpReply
 
-	shard := key2shard(op.Key)
+	key := op.Type.(KeyVal).Key
+	value := op.Type.(KeyVal).Value
+
+	shard := key2shard(key)
 	gid := kv.config.Shards[shard]
 	if gid != kv.gid {
 		return OpReply{ErrWrongGroup, ""}
@@ -298,22 +316,22 @@ func (kv *ShardKV) opExecute(op Op) OpReply {
 
 	switch op.Opcode {
 	case OP_GET:
-		value, ok := kv.database[op.Key]
+		_, ok := kv.database[key]
 		if ok {
 			opReply.Err = OK
-			opReply.Value = value
+			opReply.Value = kv.database[key]
 		} else {
 			opReply.Err = ErrNoKey
 			opReply.Value = ""
 		}
 	case OP_PUT:
-		kv.database[op.Key] = op.Value
+		kv.database[key] = value
 		opReply.Err = OK
-		opReply.Value = kv.database[op.Key]
+		opReply.Value = kv.database[key]
 	case OP_APPEND:
-		kv.database[op.Key] += op.Value
+		kv.database[key] += value
 		opReply.Err = OK
-		opReply.Value = kv.database[op.Key]
+		opReply.Value = kv.database[key]
 	}
 
 	return opReply
@@ -333,11 +351,13 @@ func (kv *ShardKV) processClientOp(op Op, term int, index int) OpReply {
 			opReply = kv.opExecute(op)
 			if seqid >= opCache.SeqId {
 				opCache = &OpCache{term, index, op.Opcode, seqid, false}
+				kv.clientop[clientid] = opCache
 			}
 		} else {
-			if (seqid >= opCache.SeqId && index >= opCache.Index) || !opCache.IsExec {
+			if (seqid > opCache.SeqId && index >= opCache.Index) || !opCache.IsExec {
 				opReply = kv.opExecute(op)
 				opCache = &OpCache{term, index, op.Opcode, seqid, true}
+				kv.clientop[clientid] = opCache
 			} else {
 				opReply = OpReply{OK, ""}
 			}
@@ -349,8 +369,9 @@ func (kv *ShardKV) processClientOp(op Op, term int, index int) OpReply {
 		} else {
 			opCache = &OpCache{term, index, op.Opcode, seqid, true}
 		}
+		kv.clientop[clientid] = opCache
 	}
-	kv.clientop[clientid] = opCache
+
 	return opReply
 }
 
@@ -361,9 +382,12 @@ func (kv *ShardKV) processOp(op Op, index int) {
 	term, isLeader := kv.rf.GetState()
 
 	var opReply OpReply
-	if op.Opcode == OP_MIGRATE {
-		opReply = kv.processMigrateOp(op, term, index, isLeader)
-	} else {
+	switch op.Opcode {
+	case OP_CONFIG:
+		opReply = kv.processConfigOp(op, term, index, isLeader)
+	case OP_MIGRATE:
+		opReply = kv.processMigrateOp(op, term, index)
+	default:
 		opReply = kv.processClientOp(op, term, index)
 	}
 
@@ -415,13 +439,13 @@ func (kv *ShardKV) ingestSnapshot(snapshot []byte, index int) {
 	var lastIncludedIndex int
 	var database map[string]string
 	var clientop map[int64]*OpCache
-	var config shardctrler.Config
-	//var state int
+	var config Cfg
+	var migrateStat map[int]bool
 	if decoder.Decode(&lastIncludedIndex) != nil ||
 		decoder.Decode(&database) != nil ||
 		decoder.Decode(&clientop) != nil ||
-		decoder.Decode(&config) != nil { /*||
-		decoder.Decode(&state) != nil */
+		decoder.Decode(&config) != nil ||
+		decoder.Decode(&migrateStat) != nil {
 		raft.LogPrint(raft.ERROR, dKvServer, "%s snapshot Decode() error", kv.logPrefix)
 		return
 	}
@@ -453,19 +477,25 @@ func (kv *ShardKV) ingestSnapshot(snapshot []byte, index int) {
 			_, ok := clientop[clientid]
 			if !ok {
 				op.IsExec = false
+			} else {
+				if op.Opcode != OP_CONFIG && op.Opcode != OP_MIGRATE && op.IsExec {
+					op.IsExec = false
+				}
 			}
 		}
 	}
 
 	kv.lastIncludedIndex = lastIncludedIndex
 	kv.config = config
-	//kv.state = state
-	for key, value := range database {
+	kv.migrateStat = migrateStat
+	kv.database = database
+	/*for key, value := range database {
 		// may receive migrate data, so can not use assignment directly
 		kv.database[key] = value
-	}
+	}*/
 
 	raft.LogPrint(raft.INFO, dKvServer, "%s ingest kv.config %+v", kv.logPrefix, kv.config)
+	raft.LogPrint(raft.INFO, dKvServer, "%s ingest kv.migrateStat %+v", kv.logPrefix, kv.migrateStat)
 
 	raft.LogPrint(raft.INFO, dKvServer, "%s ingest snapshot LII=%d", kv.logPrefix, kv.lastIncludedIndex)
 	raft.LogPrint(raft.INFO, dKvServer, "%s ingest snapshot database = %+v", kv.logPrefix, kv.database)
@@ -486,55 +516,24 @@ func (kv *ShardKV) createSnapshot(force bool) {
 			encoder.Encode(kv.database)
 			encoder.Encode(kv.clientop)
 			encoder.Encode(kv.config)
-			//encoder.Encode(kv.state)
+			encoder.Encode(kv.migrateStat)
 			kv.rf.Snapshot(kv.lastIncludedIndex, byteBuffer.Bytes())
 		}
 	}
 }
 
-func (kv *ShardKV) ticker() {
-	for !kv.killed() {
+func (kv *ShardKV) processInternalReq(op Op) {
 
-		kv.mu.Lock()
+	raft.LogPrint(raft.INFO, dKvServer, "%s internal op = %+v", kv.logPrefix, op)
+	index, term, _ := kv.rf.Start(op)
 
-		_, isLeader := kv.rf.GetState()
-		if isLeader {
-			for {
-				if len(kv.migratingDb) <= 0 && kv.state == SERVING {
-					break
-				}
-				kv.cfgUpdateCond.Wait()
-			}
-			config := kv.cfgck.Query(-1)
-			if config.Num > kv.config.Num {
-				num := kv.config.Num + 1
-				newcfg := kv.cfgck.Query(num)
+	opCache := &OpCache{term, index, op.Opcode, op.SeqId, false}
+	kv.clientop[op.ClientId] = opCache
 
-				kv.state = MIGRATING
+	replyCh := make(chan OpReply)
+	kv.replyChs[index] = replyCh
 
-				op := Op{OP_MIGRATE, CFG_CLIENT_ID, int64(num), "", "", newcfg}
-				raft.LogPrint(raft.INFO, dKvServer, "%s num = %d ticker op = %+v", kv.logPrefix, num, op)
-				index, term, _ := kv.rf.Start(op)
-
-				opCache := &OpCache{term, index, op.Opcode, op.SeqId, false}
-				kv.clientop[op.ClientId] = opCache
-
-				replyCh := make(chan OpReply)
-				kv.replyChs[index] = replyCh
-
-				kv.mu.Unlock()
-				<-replyCh
-				kv.migrateCond.Broadcast()
-				kv.mu.Lock()
-
-			} else {
-				kv.config = config
-				raft.LogPrint(raft.INFO, dKvServer, "%s ticker config = %+v", kv.logPrefix, kv.config)
-			}
-		}
-
-		kv.mu.Unlock()
-
-		time.Sleep(100 * time.Millisecond)
-	}
+	go func() {
+		<-replyCh
+	}()
 }

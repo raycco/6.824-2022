@@ -2,17 +2,15 @@ package shardkv
 
 import (
 	"bytes"
-	"time"
 
 	"6.824/labgob"
 	"6.824/raft"
-	"6.824/shardctrler"
 )
 
 const (
-	PUSH_CLIENT_ID = -1
-	PULL_CLIENT_ID = -2
-	CFG_CLIENT_ID  = -3
+	MIGRATE_CLIENT_ID = -1
+	CONFIG_CLIENT_ID  = -2
+	PUSH_CLIENT_ID    = -3
 )
 
 const (
@@ -21,18 +19,10 @@ const (
 	MODE_PULL
 )
 
-const (
-	INIT = iota
-	SERVING
-	WAIT
-	MIGRATING
-	MIGRATED
-)
-
 type RequestMigrateArgs struct {
 	Num    int
 	Gid    int
-	Config shardctrler.Config
+	Config Cfg
 	Data   []byte // raw bytes of the shard to migrate
 }
 
@@ -49,120 +39,75 @@ type RequestMigrateProgressReply struct {
 	Err Err
 }
 
-func (kv *ShardKV) processMigrateOp(op Op, term int, index int, isleader bool) OpReply {
+type Migrate struct {
+	Num       int
+	Complete  bool
+	KeyVal    KeyVal
+	WaitCount int
+}
 
-	cfg := op.Cfg.(shardctrler.Config)
-	var opReply OpReply
-	newcfg := shardctrler.Config{}
-	newcfg.Num = cfg.Num
-	newcfg.Groups = make(map[int][]string)
-	newcfg.Shards = cfg.Shards
-	for gid, servers := range cfg.Groups {
-		newcfg.Groups[gid] = servers
-	}
+type DbStat struct {
+	Num          int
+	Stat         State
+	Complete     bool
+	LastKey      string
+	LastValue    string
+	SrcGidShards map[int][]int
+	DstGidShards map[int][]int
+}
 
-	if !isleader { // todo: no leader when restart
-		kv.config = newcfg
-		opReply = OpReply{OK, ""}
-		return opReply
-	}
-
-	//if kv.config.Num+1 == newcfg.Num {
+func (kv *ShardKV) processMigrateOp(op Op, term int, index int) OpReply {
 	clientid := op.ClientId
 	seqid := op.SeqId
 
+	migrate := op.Type.(Migrate)
+
+	var opReply OpReply
+
 	opCache, ok := kv.clientop[clientid]
+	raft.LogPrint(raft.INFO, dKvServer, "%s index %d num %d process op cache %v",
+		kv.logPrefix, index, kv.config.Num, opCache)
 	if ok {
-		if seqid >= opCache.SeqId && index >= opCache.Index || !opCache.IsExec {
+		if (seqid >= opCache.SeqId && index >= opCache.Index) || !opCache.IsExec {
 			opCache = &OpCache{term, index, op.Opcode, seqid, true}
 			kv.clientop[clientid] = opCache
-			if kv.config.Num > 0 {
-				//kv.dataMigration(newcfg, true)
-				mode, gidShards := kv.prepareMigration(newcfg)
-				for {
-					success := kv.dataMigration(newcfg, mode, gidShards)
-					if success {
-						break
-					}
-					time.Sleep(100 * time.Millisecond)
-				}
-			} else {
+			kv.waitPushCount[migrate.Num] = migrate.WaitCount
+			switch migrate.KeyVal.Key {
+			case "MAX":
 				kv.state = SERVING
+				kv.migrateStat[kv.config.Num] = true
+				kv.migratingCond.Signal()
+				kv.cfgUpdateCond.Signal()
+			case "MIN":
+				kv.state = WAITING
+				kv.migrateStat[kv.config.Num] = false
+			default:
+				kv.database[migrate.KeyVal.Key] = migrate.KeyVal.Value
+				opReply.Value = kv.database[migrate.KeyVal.Key]
 			}
 		}
 	} else {
 		opCache = &OpCache{term, index, op.Opcode, seqid, true}
 		kv.clientop[clientid] = opCache
-		if kv.config.Num > 0 {
-			//kv.dataMigration(newcfg, true)
-			mode, gidShards := kv.prepareMigration(newcfg)
-			for {
-				success := kv.dataMigration(newcfg, mode, gidShards)
-				if success {
-					break
-				}
-				time.Sleep(100 * time.Millisecond)
-			}
-		} else {
+		kv.waitPushCount[migrate.Num] = migrate.WaitCount
+		switch migrate.KeyVal.Key {
+		case "MAX":
 			kv.state = SERVING
+			kv.migrateStat[kv.config.Num] = true
+			kv.migratingCond.Signal()
+			kv.cfgUpdateCond.Signal()
+		case "MIN":
+			kv.state = WAITING
+			kv.migrateStat[kv.config.Num] = false
+		default:
+			kv.database[migrate.KeyVal.Key] = migrate.KeyVal.Value
+			opReply.Value = kv.database[migrate.KeyVal.Key]
 		}
 	}
-	opReply = OpReply{OK, ""}
-	kv.config = newcfg
-	//} else {
-	//	opReply = OpReply{ErrWrongMigrate, ""}
-	//}
-
 	return opReply
 }
 
-func (kv *ShardKV) prepareMigration(config shardctrler.Config) (int, map[int][]int) {
-	raft.LogPrint(raft.INFO, dKvServer, "%s prepare data migrate %v => %v", kv.logPrefix, kv.config.Shards, config.Shards)
-
-	gidShardsSrcMap := make(map[int][]int)
-	gidShardsDstMap := make(map[int][]int)
-	for shard := 0; shard < len(config.Shards); shard++ {
-		ngid := config.Shards[shard]
-		ogid := kv.config.Shards[shard]
-		if ogid != ngid {
-			if ogid == kv.gid { // push
-				// start migrating the data for that shard to the replica group that is taking over ownership
-				gidShardsDstMap[ngid] = append(gidShardsDstMap[ngid], shard)
-			} else if ngid == kv.gid { // pull
-				// wait for the previous owner to send over the old shard data
-				gidShardsSrcMap[ogid] = append(gidShardsSrcMap[ogid], shard)
-			} else {
-				// other group need wait
-			}
-		}
-	}
-
-	/*if len(gidShardsSrcMap) > 0 {
-		return MODE_PULL, gidShardsSrcMap
-	} else if len(gidShardsDstMap) > 0 {
-		return MODE_PUSH, gidShardsDstMap
-	} else {
-		return MODE_UNKNOWN, nil
-	}*/
-	if len(gidShardsSrcMap) > 0 {
-		kv.state = WAIT
-		kv.waitPushCount[config.Num] = len(gidShardsSrcMap)
-		raft.LogPrint(raft.INFO, dKvServer, "%s prepare data migrate wait for push state = %d src group count = %d",
-			kv.logPrefix, kv.state, kv.waitPushCount[config.Num])
-	} else if len(gidShardsDstMap) > 0 {
-		kv.state = MIGRATING
-	} else {
-		kv.state = SERVING
-	}
-
-	if kv.state == MIGRATING {
-		return MODE_PUSH, gidShardsDstMap
-	} else {
-		return MODE_UNKNOWN, nil
-	}
-}
-
-func (kv *ShardKV) dataMigration(config shardctrler.Config, mode int, gidShards map[int][]int) bool {
+func (kv *ShardKV) dataMigration(config Cfg, mode int, gidShards map[int][]int) bool {
 	/*if kv.state == MIGRATING {
 		return
 	}*/
@@ -261,7 +206,8 @@ func (kv *ShardKV) MigratePush(args *RequestMigrateArgs, reply *RequestMigrateRe
 	defer kv.mu.Unlock()
 
 	_, isLeader := kv.rf.GetState()
-	raft.LogPrint(raft.INFO, dKvServer, "%s Leader=%v receive push data request", kv.logPrefix, isLeader)
+	raft.LogPrint(raft.INFO, dKvServer, "%s Leader=%v receive push data request num = %d, args num = %d",
+		kv.logPrefix, isLeader, kv.config.Num, args.Num)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		return
@@ -273,7 +219,10 @@ func (kv *ShardKV) MigratePush(args *RequestMigrateArgs, reply *RequestMigrateRe
 		}
 		kv.migrateCond.Wait()
 	}
-	kv.state = MIGRATING
+
+	if kv.waitPushCount[kv.config.Num] == len(kv.migratingGidConfig) {
+		kv.state = MIGRATING
+	}
 
 	byteBuffer := bytes.NewBuffer(args.Data)
 	decoder := labgob.NewDecoder(byteBuffer)
@@ -289,7 +238,6 @@ func (kv *ShardKV) MigratePush(args *RequestMigrateArgs, reply *RequestMigrateRe
 	}
 
 	kv.migratingGidConfig[args.Gid] = args.Config
-	//kv.createSnapshot(true)
 
 	go kv.migrater(sharddb)
 	//kv.cfgUpdateCond.Wait()
@@ -300,9 +248,12 @@ func (kv *ShardKV) MigrateProcess(args *RequestMigrateProgressArgs, reply *Reque
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
-	kv.state = SERVING
 	_, isLeader := kv.rf.GetState()
 	if isLeader {
+		kv.state = SERVING
+		kv.migrateStat[kv.config.Num] = true
+		migrate := Migrate{kv.config.Num, true, KeyVal{"MAX", ""}, 0}
+		kv.processInternalReq(Op{OP_MIGRATE, MIGRATE_CLIENT_ID, int64(kv.config.Num), migrate})
 		raft.LogPrint(raft.INFO, dKvServer, "%s receive migrate complete", kv.logPrefix)
 		kv.cfgUpdateCond.Signal()
 		reply.Err = OK
@@ -350,20 +301,37 @@ func (kv *ShardKV) MigratePull(args *RequestMigrateArgs, reply *RequestMigrateRe
 func (kv *ShardKV) migrater(sharddb map[string]string) {
 
 	kv.mu.Lock()
-	defer kv.mu.Unlock()
 
 	kv.state = MIGRATING
 
 	for key, value := range sharddb {
-		kv.lastPushSeqId = kv.lastPushSeqId + 1
-		op := Op{OP_PUT, PUSH_CLIENT_ID, kv.lastPushSeqId, key, value, nil}
-		kv.processRequest(op)
+		op := Op{OP_MIGRATE, MIGRATE_CLIENT_ID, int64(kv.config.Num), Migrate{kv.config.Num, false, KeyVal{key, value}, kv.waitPushCount[kv.config.Num]}}
+		raft.LogPrint(raft.INFO, dKvServer, "%s migrate op = %+v", kv.logPrefix, op)
+		index, term, _ := kv.rf.Start(op)
+
+		opCache := &OpCache{term, index, op.Opcode, op.SeqId, false}
+		kv.clientop[op.ClientId] = opCache
+
+		replyCh := make(chan OpReply)
+		kv.replyChs[index] = replyCh
+
+		kv.mu.Unlock()
+		opReply := <-replyCh
+		kv.mu.Lock()
+		raft.LogPrint(raft.INFO, dKvServer, "%s migrate op = %+v", kv.logPrefix, opReply)
+
 		kv.migratingCond.Signal()
 		delete(kv.migratingDb, key)
 	}
 
+	raft.LogPrint(raft.INFO, dKvServer, "%s waitPushCount = %d, config count = %d",
+		kv.logPrefix, kv.waitPushCount[kv.config.Num], len(kv.migratingGidConfig))
+
 	if len(kv.migratingDb) <= 0 && kv.waitPushCount[kv.config.Num] == len(kv.migratingGidConfig) {
-		kv.state = SERVING
+		//kv.state = SERVING
+		kv.migrateStat[kv.config.Num] = true
+		migrate := Migrate{kv.config.Num, true, KeyVal{"MAX", ""}, 0}
+		kv.processInternalReq(Op{OP_MIGRATE, MIGRATE_CLIENT_ID, int64(kv.config.Num), migrate})
 		kv.cfgUpdateCond.Signal()
 
 		for gid, config := range kv.migratingGidConfig {
@@ -385,4 +353,5 @@ func (kv *ShardKV) migrater(sharddb map[string]string) {
 			delete(kv.migratingGidConfig, gid)
 		}
 	}
+	kv.mu.Unlock()
 }
