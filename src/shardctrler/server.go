@@ -512,7 +512,7 @@ func (sc *ShardCtrler) opQueryExec(args QueryArgs) Config {
 	config.Groups = make(map[int][]string)
 	cfgLen := len(sc.configs)
 	num := args.Num
-	if args.Num < 0 || args.Num > cfgLen {
+	if args.Num < 0 || args.Num >= cfgLen {
 		num = cfgLen - 1
 	}
 
