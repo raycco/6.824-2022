@@ -2,6 +2,7 @@ package shardkv
 
 import (
 	"bytes"
+	"time"
 
 	"6.824/labgob"
 	"6.824/raft"
@@ -10,7 +11,11 @@ import (
 const (
 	MIGRATE_CLIENT_ID = -1
 	CONFIG_CLIENT_ID  = -2
-	PUSH_CLIENT_ID    = -3
+)
+
+const (
+	KEY_MAX = "MAX"
+	KEY_MIN = "MIN"
 )
 
 const (
@@ -47,20 +52,39 @@ type Migrate struct {
 }
 
 type DbStat struct {
-	Num          int
-	Stat         State
-	Complete     bool
+	Stat         int
 	LastKey      string
 	LastValue    string
 	SrcGidShards map[int][]int
 	DstGidShards map[int][]int
+	Config       Cfg
 }
 
-func (kv *ShardKV) processMigrateOp(op Op, term int, index int) OpReply {
+func (src *DbStat) Copy() DbStat {
+	var dst DbStat
+	dst.Stat = src.Stat
+	dst.LastKey = src.LastKey
+	dst.LastValue = src.LastValue
+
+	dst.SrcGidShards = make(map[int][]int)
+	for gid, shards := range src.SrcGidShards {
+		dst.SrcGidShards[gid] = shards
+	}
+
+	dst.DstGidShards = make(map[int][]int)
+	for gid, shards := range src.DstGidShards {
+		dst.DstGidShards[gid] = shards
+	}
+	dst.Config = src.Config.Copy()
+	return dst
+}
+
+func (kv *ShardKV) processMigrateOp(op Op, term int, index int, isleader bool) OpReply {
 	clientid := op.ClientId
 	seqid := op.SeqId
 
-	migrate := op.Type.(Migrate)
+	dbstat := op.Type.(DbStat)
+	kv.dbstat = dbstat.Copy()
 
 	var opReply OpReply
 
@@ -71,39 +95,56 @@ func (kv *ShardKV) processMigrateOp(op Op, term int, index int) OpReply {
 		if (seqid >= opCache.SeqId && index >= opCache.Index) || !opCache.IsExec {
 			opCache = &OpCache{term, index, op.Opcode, seqid, true}
 			kv.clientop[clientid] = opCache
-			kv.waitPushCount[migrate.Num] = migrate.WaitCount
-			switch migrate.KeyVal.Key {
+			switch dbstat.LastKey {
 			case "MAX":
-				kv.state = SERVING
-				kv.migrateStat[kv.config.Num] = true
 				kv.migratingCond.Signal()
 				kv.cfgUpdateCond.Signal()
 			case "MIN":
-				kv.state = WAITING
-				kv.migrateStat[kv.config.Num] = false
+				if isleader && dbstat.Stat == PUSHING {
+					for {
+						success := kv.dataMigration(dbstat.Config, MODE_PUSH, dbstat.DstGidShards)
+						if success {
+							break
+						}
+						time.Sleep(100 * time.Millisecond)
+					}
+				}
 			default:
-				kv.database[migrate.KeyVal.Key] = migrate.KeyVal.Value
-				opReply.Value = kv.database[migrate.KeyVal.Key]
+				kv.database[dbstat.LastKey] = dbstat.LastValue
+				opReply.Value = kv.database[dbstat.LastKey]
 			}
 		}
 	} else {
 		opCache = &OpCache{term, index, op.Opcode, seqid, true}
 		kv.clientop[clientid] = opCache
-		kv.waitPushCount[migrate.Num] = migrate.WaitCount
-		switch migrate.KeyVal.Key {
+		switch dbstat.LastKey {
 		case "MAX":
-			kv.state = SERVING
-			kv.migrateStat[kv.config.Num] = true
 			kv.migratingCond.Signal()
 			kv.cfgUpdateCond.Signal()
 		case "MIN":
-			kv.state = WAITING
-			kv.migrateStat[kv.config.Num] = false
+			if isleader && dbstat.Stat == PUSHING {
+				for {
+					success := kv.dataMigration(dbstat.Config, MODE_PUSH, dbstat.DstGidShards)
+					if success {
+						break
+					}
+					time.Sleep(100 * time.Millisecond)
+				}
+			}
 		default:
-			kv.database[migrate.KeyVal.Key] = migrate.KeyVal.Value
-			opReply.Value = kv.database[migrate.KeyVal.Key]
+			kv.database[dbstat.LastKey] = dbstat.LastValue
+			opReply.Value = kv.database[dbstat.LastKey]
 		}
 	}
+
+	if dbstat.LastKey == "MIN" || dbstat.LastKey == "MAX" {
+		kv.lastConfig = kv.config.Copy()
+		kv.config = kv.dbstat.Config.Copy()
+		kv.migrateCond.Broadcast()
+	}
+
+	raft.LogPrint(raft.INFO, dKvServer, "%s index %d num %d state %v",
+		kv.logPrefix, index, kv.config.Num, kv.dbstat)
 	return opReply
 }
 
@@ -220,10 +261,6 @@ func (kv *ShardKV) MigratePush(args *RequestMigrateArgs, reply *RequestMigrateRe
 		kv.migrateCond.Wait()
 	}
 
-	if kv.waitPushCount[kv.config.Num] == len(kv.migratingGidConfig) {
-		kv.state = MIGRATING
-	}
-
 	byteBuffer := bytes.NewBuffer(args.Data)
 	decoder := labgob.NewDecoder(byteBuffer)
 
@@ -250,10 +287,9 @@ func (kv *ShardKV) MigrateProcess(args *RequestMigrateProgressArgs, reply *Reque
 
 	_, isLeader := kv.rf.GetState()
 	if isLeader {
-		kv.state = SERVING
-		kv.migrateStat[kv.config.Num] = true
-		migrate := Migrate{kv.config.Num, true, KeyVal{"MAX", ""}, 0}
-		kv.processInternalReq(Op{OP_MIGRATE, MIGRATE_CLIENT_ID, int64(kv.config.Num), migrate})
+		kv.convertToServing()
+		op := Op{OP_MIGRATE, MIGRATE_CLIENT_ID, int64(kv.config.Num), kv.dbstat.Copy()}
+		kv.processInternalReq(op)
 		raft.LogPrint(raft.INFO, dKvServer, "%s receive migrate complete", kv.logPrefix)
 		kv.cfgUpdateCond.Signal()
 		reply.Err = OK
@@ -280,8 +316,6 @@ func (kv *ShardKV) MigratePull(args *RequestMigrateArgs, reply *RequestMigrateRe
 		kv.migrateCond.Wait()
 	}
 
-	kv.state = MIGRATING
-
 	sharddb := make(map[string]string)
 	for _, shard := range args.Config.Shards {
 		for key, value := range kv.database {
@@ -302,10 +336,12 @@ func (kv *ShardKV) migrater(sharddb map[string]string) {
 
 	kv.mu.Lock()
 
-	kv.state = MIGRATING
+	kv.dbstat.Stat = MIGRATING
 
 	for key, value := range sharddb {
-		op := Op{OP_MIGRATE, MIGRATE_CLIENT_ID, int64(kv.config.Num), Migrate{kv.config.Num, false, KeyVal{key, value}, kv.waitPushCount[kv.config.Num]}}
+		kv.dbstat.LastKey = key
+		kv.dbstat.LastValue = value
+		op := Op{OP_MIGRATE, MIGRATE_CLIENT_ID, int64(kv.config.Num), kv.dbstat}
 		raft.LogPrint(raft.INFO, dKvServer, "%s migrate op = %+v", kv.logPrefix, op)
 		index, term, _ := kv.rf.Start(op)
 
@@ -325,13 +361,12 @@ func (kv *ShardKV) migrater(sharddb map[string]string) {
 	}
 
 	raft.LogPrint(raft.INFO, dKvServer, "%s waitPushCount = %d, config count = %d",
-		kv.logPrefix, kv.waitPushCount[kv.config.Num], len(kv.migratingGidConfig))
+		kv.logPrefix, len(kv.dbstat.SrcGidShards), len(kv.migratingGidConfig))
 
-	if len(kv.migratingDb) <= 0 && kv.waitPushCount[kv.config.Num] == len(kv.migratingGidConfig) {
-		//kv.state = SERVING
-		kv.migrateStat[kv.config.Num] = true
-		migrate := Migrate{kv.config.Num, true, KeyVal{"MAX", ""}, 0}
-		kv.processInternalReq(Op{OP_MIGRATE, MIGRATE_CLIENT_ID, int64(kv.config.Num), migrate})
+	if len(kv.migratingDb) <= 0 && len(kv.dbstat.SrcGidShards) == len(kv.migratingGidConfig) {
+		kv.convertToServing()
+		op := Op{OP_MIGRATE, MIGRATE_CLIENT_ID, int64(kv.config.Num), kv.dbstat.Copy()}
+		kv.processInternalReq(op)
 		kv.cfgUpdateCond.Signal()
 
 		for gid, config := range kv.migratingGidConfig {
@@ -354,4 +389,16 @@ func (kv *ShardKV) migrater(sharddb map[string]string) {
 		}
 	}
 	kv.mu.Unlock()
+}
+
+func (kv *ShardKV) convertToServing() {
+	kv.dbstat.Stat = SERVING
+	kv.dbstat.LastKey = KEY_MAX
+	kv.dbstat.LastValue = ""
+	for gid := range kv.dbstat.DstGidShards {
+		delete(kv.dbstat.DstGidShards, gid)
+	}
+	for gid := range kv.dbstat.SrcGidShards {
+		delete(kv.dbstat.SrcGidShards, gid)
+	}
 }

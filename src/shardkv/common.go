@@ -16,7 +16,7 @@ const (
 	ErrNoKey         = "ErrNoKey"
 	ErrWrongGroup    = "ErrWrongGroup"
 	ErrWrongLeader   = "ErrWrongLeader"
-	ErrWrongMigrate  = "ErrWrongMigrate"
+	ErrDataMigrate   = "ErrDataMigrate"
 	ErrWaitCfgChange = "ErrWaitCfgChange"
 )
 
@@ -25,15 +25,15 @@ const (
 	dKvClient raft.LogTopic = "KVCL"
 )
 
-type State int
-
 const (
-	ACTIVING  State = 0x01
-	CONFIGING State = 0x02
-	SERVING   State = 0x04
-	WAITING   State = 0x08
-	MIGRATING State = 0x10
-	DELETING  State = 0x20
+	ACTIVING  = 0x01
+	CONFIGING = 0x02
+	SERVING   = 0x04
+	WAITING   = 0x08
+	PUSHING   = 0x10
+	PULLING   = 0x20
+	MIGRATING = 0x40
+	DELETING  = 0x80
 )
 
 type Err string
@@ -83,4 +83,13 @@ func removeKey(slice []string, key string) []string {
 		}
 	}
 	return slice
+}
+
+func containsShard(slice []int, shard int) bool {
+	for _, v := range slice {
+		if v == shard {
+			return true
+		}
+	}
+	return false
 }
