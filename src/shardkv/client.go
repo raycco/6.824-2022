@@ -90,6 +90,7 @@ func (ck *Clerk) Get(key string) string {
 	for {
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
+		args.Num = ck.config.Num
 		if servers, ok := ck.config.Groups[gid]; ok {
 			srv := ck.make_end(servers[ck.grpLeaderId[gid]])
 			var reply GetReply
@@ -143,6 +144,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	for {
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
+		args.Num = ck.config.Num
 		if servers, ok := ck.config.Groups[gid]; ok {
 			srv := ck.make_end(servers[ck.grpLeaderId[gid]])
 			var reply PutAppendReply

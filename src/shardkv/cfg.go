@@ -49,8 +49,8 @@ func (kv *ShardKV) processConfigOp(op Op, term int, index int, isleader bool) Op
 		raft.LogPrint(raft.INFO, dKvServer, "%s index %d num %d process config op cache %v",
 			kv.logPrefix, index, kv.config.Num, opCache)
 		if ok {
-			if (seqid >= opCache.SeqId && index >= opCache.Index) || !opCache.IsExec {
-				opCache = &OpCache{term, index, op.Opcode, seqid, true}
+			if (seqid > opCache.SeqId && index >= opCache.Index) || opCache.Err == Empty {
+				opCache = &OpCache{term, index, op.Opcode, kv.config.Num, seqid, OK}
 				kv.clientop[clientid] = opCache
 				if isleader {
 					if kv.config.Num > 0 {
@@ -64,13 +64,13 @@ func (kv *ShardKV) processConfigOp(op Op, term int, index int, isleader bool) Op
 						}*/
 					} else {
 						kv.dbstat.Stat = SERVING
-						op := Op{OP_MIGRATE, MIGRATE_CLIENT_ID, int64(newcfg.Num), kv.dbstat.Copy()}
+						op := Op{OP_MIGRATE, kv.config.Num, MIGRATE_CLIENT_ID, int64(newcfg.Num), kv.dbstat.Copy()}
 						kv.processInternalReq(op)
 					}
 				}
 			}
 		} else {
-			opCache = &OpCache{term, index, op.Opcode, seqid, true}
+			opCache = &OpCache{term, index, op.Opcode, kv.config.Num, seqid, OK}
 			kv.clientop[clientid] = opCache
 			if isleader {
 				if kv.config.Num > 0 {
@@ -84,7 +84,7 @@ func (kv *ShardKV) processConfigOp(op Op, term int, index int, isleader bool) Op
 					}*/
 				} else {
 					kv.dbstat.Stat = SERVING
-					op := Op{OP_MIGRATE, MIGRATE_CLIENT_ID, int64(newcfg.Num), kv.dbstat.Copy()}
+					op := Op{OP_MIGRATE, kv.config.Num, MIGRATE_CLIENT_ID, int64(newcfg.Num), kv.dbstat.Copy()}
 					kv.processInternalReq(op)
 				}
 			}
@@ -141,7 +141,7 @@ func (kv *ShardKV) prepareMigration(config Cfg) (int, map[int][]int) {
 		kv.dbstat.LastKey = KEY_MAX
 	}
 
-	op := Op{OP_MIGRATE, MIGRATE_CLIENT_ID, int64(config.Num), kv.dbstat.Copy()}
+	op := Op{OP_MIGRATE, kv.config.Num, MIGRATE_CLIENT_ID, int64(config.Num), kv.dbstat.Copy()}
 	kv.processInternalReq(op)
 
 	if kv.dbstat.Stat == PUSHING {
@@ -179,11 +179,11 @@ func (kv *ShardKV) configer() {
 						dbstat.Config = config.Copy()
 						dbstat.Stat = CONFIGING
 
-						op := Op{OP_CONFIG, CONFIG_CLIENT_ID, int64(config.Num), dbstat}
+						op := Op{OP_CONFIG, kv.config.Num, CONFIG_CLIENT_ID, int64(config.Num), dbstat}
 						raft.LogPrint(raft.INFO, dKvServer, "%s num = %d ticker op = %+v", kv.logPrefix, kv.config.Num, op)
 						index, term, _ := kv.rf.Start(op)
 
-						opCache := &OpCache{term, index, op.Opcode, op.SeqId, false}
+						opCache := &OpCache{term, index, op.Opcode, kv.config.Num, op.SeqId, Empty}
 						kv.clientop[op.ClientId] = opCache
 
 						/*replyCh := make(chan OpReply)
@@ -203,11 +203,11 @@ func (kv *ShardKV) configer() {
 					dbstat.Config = kv.dbstat.Config.Copy()
 					dbstat.Stat = CONFIGING
 
-					op := Op{OP_CONFIG, CONFIG_CLIENT_ID, int64(kv.dbstat.Config.Num), dbstat}
+					op := Op{OP_CONFIG, kv.config.Num, CONFIG_CLIENT_ID, int64(kv.dbstat.Config.Num), dbstat}
 					raft.LogPrint(raft.INFO, dKvServer, "%s num = %d ticker op = %+v", kv.logPrefix, kv.config.Num, op)
 					index, term, _ := kv.rf.Start(op)
 
-					opCache := &OpCache{term, index, op.Opcode, op.SeqId, false}
+					opCache := &OpCache{term, index, op.Opcode, kv.config.Num, op.SeqId, Empty}
 					kv.clientop[op.ClientId] = opCache
 				}
 			}

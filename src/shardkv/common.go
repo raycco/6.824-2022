@@ -12,6 +12,7 @@ import "6.824/raft"
 //
 
 const (
+	Empty            = ""
 	OK               = "OK"
 	ErrNoKey         = "ErrNoKey"
 	ErrWrongGroup    = "ErrWrongGroup"
@@ -49,6 +50,7 @@ type PutAppendArgs struct {
 	// otherwise RPC will break.
 	ClientId int64
 	SeqId    int64
+	Num      int
 }
 
 type PutAppendReply struct {
@@ -60,6 +62,7 @@ type GetArgs struct {
 	// You'll have to add definitions here.
 	ClientId int64
 	SeqId    int64
+	Num      int
 }
 
 type GetReply struct {

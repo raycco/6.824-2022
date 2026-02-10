@@ -30,6 +30,7 @@ type Op struct {
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
 	Opcode   int
+	Num      int
 	ClientId int64
 	SeqId    int64
 	Type     interface{}
@@ -44,8 +45,9 @@ type OpCache struct {
 	Term   int
 	Index  int
 	Opcode int
+	Num    int
 	SeqId  int64
-	IsExec bool
+	Err    Err
 }
 
 type ShardKV struct {
@@ -97,7 +99,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
-	op := Op{OP_GET, args.ClientId, args.SeqId, KeyVal{args.Key, ""}}
+	op := Op{OP_GET, args.Num, args.ClientId, args.SeqId, KeyVal{args.Key, ""}}
 	raft.LogPrint(raft.INFO, dKvServer, "%s recv Get request from C%d op=%+v", kv.logPrefix, args.ClientId, op)
 
 	opReply := kv.processRequest(op)
@@ -112,7 +114,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
-	op := Op{-1, args.ClientId, args.SeqId, KeyVal{args.Key, args.Value}}
+	op := Op{-1, args.Num, args.ClientId, args.SeqId, KeyVal{args.Key, args.Value}}
 	if args.Op == "Put" {
 		op.Opcode = OP_PUT
 	} else {
@@ -249,7 +251,11 @@ func (kv *ShardKV) waitForMigrate(shard int, clientid int64, key string) {
 	}
 }
 
-func (kv *ShardKV) isWrongGroup(gid int, shard int) bool {
+func (kv *ShardKV) isWrongGroup(num int, gid int, shard int) bool {
+
+	if num != kv.config.Num {
+		return true
+	}
 
 	if gid != kv.gid {
 		return true
@@ -283,7 +289,7 @@ func (kv *ShardKV) processRequest(op Op) OpReply {
 
 	shard := key2shard(key)
 	gid := kv.config.Shards[shard]
-	if kv.isWrongGroup(gid, shard) {
+	if kv.isWrongGroup(op.Num, gid, shard) {
 		return OpReply{ErrWrongGroup, ""}
 	}
 
@@ -296,7 +302,8 @@ func (kv *ShardKV) processRequest(op Op) OpReply {
 
 	if op.Opcode != OP_GET {
 		opCache, ok := kv.clientop[op.ClientId]
-		if ok && (op.SeqId < opCache.SeqId || (op.SeqId == opCache.SeqId && opCache.IsExec)) {
+		if ok && (op.SeqId < opCache.SeqId ||
+			(op.SeqId == opCache.SeqId && opCache.Err == OK)) {
 			return OpReply{OK, ""}
 		}
 	}
@@ -305,7 +312,7 @@ func (kv *ShardKV) processRequest(op Op) OpReply {
 	if !isleader {
 		return OpReply{ErrWrongLeader, ""}
 	} else {
-		opCache := &OpCache{term, index, op.Opcode, op.SeqId, false}
+		opCache := &OpCache{term, index, op.Opcode, kv.config.Num, op.SeqId, Empty}
 		kv.clientop[op.ClientId] = opCache
 
 		replyCh := make(chan OpReply)
@@ -367,13 +374,13 @@ func (kv *ShardKV) processClientOp(op Op, term int, index int) OpReply {
 		if op.Opcode == OP_GET {
 			opReply = kv.opExecute(op)
 			if seqid >= opCache.SeqId {
-				opCache = &OpCache{term, index, op.Opcode, seqid, false}
+				opCache = &OpCache{term, index, op.Opcode, kv.config.Num, seqid, Empty}
 				kv.clientop[clientid] = opCache
 			}
 		} else {
-			if (seqid > opCache.SeqId && index >= opCache.Index) || !opCache.IsExec {
+			if (seqid > opCache.SeqId && index >= opCache.Index) || opCache.Err == Empty {
 				opReply = kv.opExecute(op)
-				opCache = &OpCache{term, index, op.Opcode, seqid, true}
+				opCache = &OpCache{term, index, op.Opcode, kv.config.Num, seqid, opReply.Err}
 				kv.clientop[clientid] = opCache
 			} else {
 				opReply = OpReply{OK, ""}
@@ -382,9 +389,9 @@ func (kv *ShardKV) processClientOp(op Op, term int, index int) OpReply {
 	} else {
 		opReply = kv.opExecute(op)
 		if op.Opcode == OP_GET {
-			opCache = &OpCache{term, index, op.Opcode, seqid, false}
+			opCache = &OpCache{term, index, op.Opcode, kv.config.Num, seqid, Empty}
 		} else {
-			opCache = &OpCache{term, index, op.Opcode, seqid, true}
+			opCache = &OpCache{term, index, op.Opcode, kv.config.Num, seqid, opReply.Err}
 		}
 		kv.clientop[clientid] = opCache
 	}
@@ -478,7 +485,7 @@ func (kv *ShardKV) resotreSnapshot(snapshot []byte, index int) {
 		if !ok {
 			kv.clientop[clientid] = op
 		} else {
-			if kv.clientop[clientid].SeqId < op.SeqId {
+			if kv.clientop[clientid].SeqId <= op.SeqId {
 				kv.clientop[clientid] = op
 			}
 		}
@@ -489,15 +496,17 @@ func (kv *ShardKV) resotreSnapshot(snapshot []byte, index int) {
 	// apply message may apply one more index when create snapshot, one index apply two times
 	// 1. current seqid => op was not executed in snapshot
 	// 2. current seqid => op has executed one time in snapshot
+	// 3. two snapshot come together, snap 1 LLI = 212, not contain 213; snap 2 LLI = 213 op has executed
 	for lastApplied := lastIncludedIndex + 1; lastApplied <= kv.lastIncludedIndex; lastApplied++ {
 		for clientid, op := range kv.clientop {
 			opsnap, ok := clientop[clientid]
 			if !ok {
-				op.IsExec = false
+				op.Err = Empty
 			} else {
 				if op.Index == lastApplied {
-					if (op.SeqId > opsnap.SeqId && op.IsExec) || (op.SeqId == opsnap.SeqId && op.IsExec && !opsnap.IsExec) {
-						op.IsExec = false
+					if (op.SeqId > opsnap.SeqId && op.Err != Empty) ||
+						(op.SeqId == opsnap.SeqId && op.Err != Empty && opsnap.Err == Empty) {
+						op.Err = Empty
 					}
 				}
 			}
@@ -556,7 +565,7 @@ func (kv *ShardKV) processInternalReq(op Op) {
 	raft.LogPrint(raft.INFO, dKvServer, "%s internal op = %+v", kv.logPrefix, op)
 	index, term, _ := kv.rf.Start(op)
 
-	opCache := &OpCache{term, index, op.Opcode, op.SeqId, false}
+	opCache := &OpCache{term, index, op.Opcode, kv.config.Num, op.SeqId, Empty}
 	kv.clientop[op.ClientId] = opCache
 
 	replyCh := make(chan OpReply)

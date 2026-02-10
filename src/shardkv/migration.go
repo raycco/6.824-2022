@@ -92,8 +92,8 @@ func (kv *ShardKV) processMigrateOp(op Op, term int, index int, isleader bool) O
 	raft.LogPrint(raft.INFO, dKvServer, "%s index %d num %d process op cache %v",
 		kv.logPrefix, index, kv.config.Num, opCache)
 	if ok {
-		if (seqid >= opCache.SeqId && index >= opCache.Index) || !opCache.IsExec {
-			opCache = &OpCache{term, index, op.Opcode, seqid, true}
+		if (seqid >= opCache.SeqId && index >= opCache.Index) || opCache.Err == Empty {
+			opCache = &OpCache{term, index, op.Opcode, kv.config.Num, seqid, OK}
 			kv.clientop[clientid] = opCache
 			switch dbstat.LastKey {
 			case "MAX":
@@ -101,8 +101,9 @@ func (kv *ShardKV) processMigrateOp(op Op, term int, index int, isleader bool) O
 				kv.cfgUpdateCond.Signal()
 			case "MIN":
 				if isleader && dbstat.Stat == PUSHING {
+					gidShards := dbstat.Copy().DstGidShards
 					for {
-						success := kv.dataMigration(dbstat.Config, MODE_PUSH, dbstat.DstGidShards)
+						success := kv.dataMigration(dbstat.Config, MODE_PUSH, gidShards)
 						if success {
 							break
 						}
@@ -115,7 +116,7 @@ func (kv *ShardKV) processMigrateOp(op Op, term int, index int, isleader bool) O
 			}
 		}
 	} else {
-		opCache = &OpCache{term, index, op.Opcode, seqid, true}
+		opCache = &OpCache{term, index, op.Opcode, kv.config.Num, seqid, OK}
 		kv.clientop[clientid] = opCache
 		switch dbstat.LastKey {
 		case "MAX":
@@ -123,8 +124,9 @@ func (kv *ShardKV) processMigrateOp(op Op, term int, index int, isleader bool) O
 			kv.cfgUpdateCond.Signal()
 		case "MIN":
 			if isleader && dbstat.Stat == PUSHING {
+				gidShards := dbstat.Copy().DstGidShards
 				for {
-					success := kv.dataMigration(dbstat.Config, MODE_PUSH, dbstat.DstGidShards)
+					success := kv.dataMigration(dbstat.Config, MODE_PUSH, gidShards)
 					if success {
 						break
 					}
@@ -181,8 +183,8 @@ func (kv *ShardKV) dataMigration(config Cfg, mode int, gidShards map[int][]int) 
 
 					ok := srv.Call("ShardKV.MigratePush", &args, &reply)
 					if ok {
+						raft.LogPrint(raft.INFO, dKvServer, "%s push data migrate shards %d => G%d-S%d %s", kv.logPrefix, shards, gid, si, reply.Err)
 						if reply.Err == OK {
-							raft.LogPrint(raft.INFO, dKvServer, "%s push data migrate shards %d => G%d-S%d success", kv.logPrefix, shards, gid, si)
 							delete(gidShards, gid)
 							break
 						}
@@ -288,7 +290,7 @@ func (kv *ShardKV) MigrateProcess(args *RequestMigrateProgressArgs, reply *Reque
 	_, isLeader := kv.rf.GetState()
 	if isLeader {
 		kv.convertToServing()
-		op := Op{OP_MIGRATE, MIGRATE_CLIENT_ID, int64(kv.config.Num), kv.dbstat.Copy()}
+		op := Op{OP_MIGRATE, kv.config.Num, MIGRATE_CLIENT_ID, int64(kv.config.Num), kv.dbstat.Copy()}
 		kv.processInternalReq(op)
 		raft.LogPrint(raft.INFO, dKvServer, "%s receive migrate complete", kv.logPrefix)
 		kv.cfgUpdateCond.Signal()
@@ -341,11 +343,11 @@ func (kv *ShardKV) migrater(sharddb map[string]string) {
 	for key, value := range sharddb {
 		kv.dbstat.LastKey = key
 		kv.dbstat.LastValue = value
-		op := Op{OP_MIGRATE, MIGRATE_CLIENT_ID, int64(kv.config.Num), kv.dbstat}
+		op := Op{OP_MIGRATE, kv.config.Num, MIGRATE_CLIENT_ID, int64(kv.config.Num), kv.dbstat}
 		raft.LogPrint(raft.INFO, dKvServer, "%s migrate op = %+v", kv.logPrefix, op)
 		index, term, _ := kv.rf.Start(op)
 
-		opCache := &OpCache{term, index, op.Opcode, op.SeqId, false}
+		opCache := &OpCache{term, index, op.Opcode, kv.config.Num, op.SeqId, Empty}
 		kv.clientop[op.ClientId] = opCache
 
 		replyCh := make(chan OpReply)
@@ -365,7 +367,7 @@ func (kv *ShardKV) migrater(sharddb map[string]string) {
 
 	if len(kv.migratingDb) <= 0 && len(kv.dbstat.SrcGidShards) == len(kv.migratingGidConfig) {
 		kv.convertToServing()
-		op := Op{OP_MIGRATE, MIGRATE_CLIENT_ID, int64(kv.config.Num), kv.dbstat.Copy()}
+		op := Op{OP_MIGRATE, kv.config.Num, MIGRATE_CLIENT_ID, int64(kv.config.Num), kv.dbstat.Copy()}
 		kv.processInternalReq(op)
 		kv.cfgUpdateCond.Signal()
 
