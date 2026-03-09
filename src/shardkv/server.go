@@ -13,6 +13,7 @@ import (
 )
 
 const (
+	OP_NONE    = 0
 	OP_GET     = 1
 	OP_PUT     = 2
 	OP_APPEND  = 3
@@ -76,10 +77,10 @@ type ShardKV struct {
 	lastRaftStateSize int
 	migrateStat       map[int]bool
 
-	migrateCond  *sync.Cond
-	migrateCond1 *sync.Cond
-	migrateCh    chan int
-	migratingDb  map[string]string
+	migrateCond      *sync.Cond
+	migrateCh        chan int
+	migratingDb      map[string]string
+	migratingGrpKeys map[int][]string
 
 	migratingGidConfig map[int]Cfg
 
@@ -88,8 +89,7 @@ type ShardKV struct {
 
 	waitPushCount map[int]int // wait push count for each config version
 
-	lastPushSeqId int64
-	lastPullSeqId int64
+	migrateTasks map[int]MigrateTask
 
 	logPrefix string
 }
@@ -210,21 +210,23 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.migrateStat[0] = true
 
 	kv.migratingDb = make(map[string]string)
+	kv.migratingGrpKeys = make(map[int][]string)
 	kv.migratingGidConfig = make(map[int]Cfg)
 
 	kv.migrateCond = sync.NewCond(&kv.mu)
-	kv.migrateCond1 = sync.NewCond(&kv.mu)
 	kv.migratingCond = sync.NewCond(&kv.mu)
 	kv.cfgUpdateCond = sync.NewCond(&kv.mu)
 	kv.waitPushCount = make(map[int]int)
 
 	kv.dbstat = kv.newDbStat()
 
+	kv.migrateTasks = make(map[int]MigrateTask)
+
 	go kv.applier()
 
 	go kv.configer()
 
-	//go kv.migrater()
+	go kv.migraterex()
 
 	return kv
 }
@@ -235,16 +237,23 @@ func (kv *ShardKV) waitForMigrate(shard int, clientid int64, key string) {
 		if kv.config.Num > 1 {
 			//lastCfg := kv.cfgck.Query(kv.config.Num - 1)
 			gid := kv.lastConfig.Shards[shard]
-			if kv.dbstat.Stat == MIGRATING && len(kv.migratingGidConfig) > 0 {
+			if kv.dbstat.Stat == MIGRATING && len(kv.migratingGidConfig) > 0 && gid != kv.gid {
 				_, ok := kv.migratingGidConfig[gid]
 				_, exist := kv.migratingDb[key]
+				raft.LogPrint(raft.INFO, dKvServer, "%s wait for migrate shard = %v, gid = %v, C%d, key = %v, migratingGidConfig = %v, migratingDb = %v, lastConfig %+v",
+					kv.logPrefix, shard, gid, clientid, key, kv.migratingGidConfig, kv.migratingDb, kv.lastConfig)
 				if (!ok && !exist) || (ok && exist) {
 					wait = true
 				}
 			}
+
+			if kv.dbstat.Stat == WAITING && gid != kv.gid {
+				wait = true
+			}
 		}
 
-		if clientid == MIGRATE_CLIENT_ID || (kv.dbstat.Stat != WAITING && !wait) {
+		if clientid == MIGRATE_CLIENT_ID || (kv.dbstat.Stat != WAITING && !wait) ||
+			(kv.dbstat.Stat == WAITING && wait) {
 			break
 		}
 		kv.migratingCond.Wait()
@@ -411,6 +420,8 @@ func (kv *ShardKV) processOp(op Op, index int) {
 		opReply = kv.processConfigOp(op, term, index, isLeader)
 	case OP_MIGRATE:
 		opReply = kv.processMigrateOp(op, term, index, isLeader)
+	case OP_NONE:
+		raft.LogPrint(raft.INFO, dKvServer, "%s no-op", kv.logPrefix)
 	default:
 		opReply = kv.processClientOp(op, term, index)
 	}
@@ -480,14 +491,10 @@ func (kv *ShardKV) resotreSnapshot(snapshot []byte, index int) {
 
 	raft.LogPrint(raft.INFO, dKvServer, "%s resotre clientop %+v", kv.logPrefix, clientop)
 
-	for clientid, op := range clientop {
-		_, ok := kv.clientop[clientid]
-		if !ok {
-			kv.clientop[clientid] = op
-		} else {
-			if kv.clientop[clientid].SeqId <= op.SeqId {
-				kv.clientop[clientid] = op
-			}
+	for clientid, opsnap := range clientop {
+		op, ok := kv.clientop[clientid]
+		if !ok || op.SeqId <= opsnap.SeqId {
+			kv.clientop[clientid] = opsnap
 		}
 	}
 

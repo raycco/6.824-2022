@@ -25,19 +25,7 @@ func (kv *ShardKV) processConfigOp(op Op, term int, index int, isleader bool) Op
 	var opReply OpReply
 
 	dbstat := op.Type.(DbStat)
-
 	newcfg := dbstat.Config.Copy()
-
-	/*if !isleader { // lastMigrate: no leader when restart
-		kv.config = newcfg
-		opReply = OpReply{OK, ""}
-		return opReply
-	}*/
-
-	/*currNum := kv.config.Num
-	if currNum > 1 && currNum == newcfg.Num && kv.dbstat.Stat != SERVING {
-		kv.config = kv.lastConfig
-	}*/
 
 	if kv.config.Num+1 == newcfg.Num {
 		kv.dbstat = dbstat.Copy()
@@ -55,13 +43,6 @@ func (kv *ShardKV) processConfigOp(op Op, term int, index int, isleader bool) Op
 				if isleader {
 					if kv.config.Num > 0 {
 						kv.prepareMigration(newcfg)
-						/*for {
-							success := kv.dataMigration(newcfg, mode, gidShards)
-							if success {
-								break
-							}
-							time.Sleep(100 * time.Millisecond)
-						}*/
 					} else {
 						kv.dbstat.Stat = SERVING
 						op := Op{OP_MIGRATE, kv.config.Num, MIGRATE_CLIENT_ID, int64(newcfg.Num), kv.dbstat.Copy()}
@@ -75,13 +56,6 @@ func (kv *ShardKV) processConfigOp(op Op, term int, index int, isleader bool) Op
 			if isleader {
 				if kv.config.Num > 0 {
 					kv.prepareMigration(newcfg)
-					/*for {
-						success := kv.dataMigration(newcfg, mode, gidShards)
-						if success {
-							break
-						}
-						time.Sleep(100 * time.Millisecond)
-					}*/
 				} else {
 					kv.dbstat.Stat = SERVING
 					op := Op{OP_MIGRATE, kv.config.Num, MIGRATE_CLIENT_ID, int64(newcfg.Num), kv.dbstat.Copy()}
@@ -152,6 +126,7 @@ func (kv *ShardKV) prepareMigration(config Cfg) (int, map[int][]int) {
 }
 
 func (kv *ShardKV) configer() {
+	init_first := true
 	for !kv.killed() {
 
 		kv.mu.Lock()
@@ -162,7 +137,15 @@ func (kv *ShardKV) configer() {
 
 		_, isLeader := kv.rf.GetState()
 		if isLeader {
-
+			if init_first {
+				// 102-S0 log index 265即将dbstat设置为serving，
+				// 但是102-S1与S2 commit index到264，此时kill server，
+				// 重启后leader变为S1，265不会apply，102不会进入serving状态
+				init_first = false
+				var op Op
+				op.Opcode = OP_NONE
+				kv.rf.Start(op)
+			}
 			/*for {
 				if len(kv.migratingDb) <= 0 && kv.dbstat.Stat == SERVING {
 					break
@@ -195,6 +178,21 @@ func (kv *ShardKV) configer() {
 						kv.mu.Lock()*/
 					}
 
+				} else if kv.dbstat.Stat == PUSHING {
+					gidShards := kv.dbstat.Copy().DstGidShards
+					for {
+						success := kv.dataMigration(kv.dbstat.Config, MODE_PUSH, gidShards)
+						if success {
+							break
+						}
+						time.Sleep(100 * time.Millisecond)
+					}
+				} else if kv.dbstat.Stat == MIGRATING {
+					if len(kv.dbstat.SrcGidShards) <= 0 {
+						kv.convertToServing()
+						op := Op{OP_MIGRATE, kv.config.Num, MIGRATE_CLIENT_ID, int64(kv.config.Num), kv.dbstat.Copy()}
+						kv.processInternalReq(op)
+					}
 				}
 			} else if kv.dbstat.Config.Num == kv.config.Num+1 {
 				raft.LogPrint(raft.INFO, dKvServer, "%s ticker config = %+v", kv.logPrefix, kv.config)

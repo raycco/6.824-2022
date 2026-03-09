@@ -12,13 +12,15 @@ import "6.824/raft"
 //
 
 const (
-	Empty            = ""
-	OK               = "OK"
-	ErrNoKey         = "ErrNoKey"
-	ErrWrongGroup    = "ErrWrongGroup"
-	ErrWrongLeader   = "ErrWrongLeader"
-	ErrDataMigrate   = "ErrDataMigrate"
-	ErrWaitCfgChange = "ErrWaitCfgChange"
+	Empty              = ""
+	OK                 = "OK"
+	ErrNoKey           = "ErrNoKey"
+	ErrWrongGroup      = "ErrWrongGroup"
+	ErrWrongLeader     = "ErrWrongLeader"
+	ErrDataMigrate     = "ErrDataMigrate"
+	ErrCfgExpired      = "ErrCfgExpired"
+	ErrMigrateComplete = "ErrMigrateComplete"
+	ErrMigrating       = "ErrMigrating"
 )
 
 const (
