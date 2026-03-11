@@ -64,7 +64,7 @@ func (ck *Clerk) Query(num int) Config {
 		var reply QueryReply
 		raft.LogPrint(raft.INFO, dScClient, "C%d send Query request to S%d args %+v", ck.clientId, ck.leaderId, args)
 		ok := ck.servers[ck.leaderId].Call("ShardCtrler.Query", args, &reply)
-		raft.LogPrint(raft.INFO, dScClient, "C%d receive Query response to S%d reply %+v", ck.clientId, ck.leaderId, reply)
+		raft.LogPrint(raft.INFO, dScClient, "C%d receive Query response from S%d ok %v reply %+v", ck.clientId, ck.leaderId, ok, reply)
 		if ok && !reply.WrongLeader {
 			return reply.Config
 		}
@@ -101,7 +101,7 @@ func (ck *Clerk) Join(servers map[int][]string) {
 		var reply JoinReply
 		raft.LogPrint(raft.INFO, dScClient, "C%d send Join request to S%d args %+v", ck.clientId, ck.leaderId, args)
 		ok := ck.servers[ck.leaderId].Call("ShardCtrler.Join", args, &reply)
-		raft.LogPrint(raft.INFO, dScClient, "C%d receive Join response to S%d reply %+v", ck.clientId, ck.leaderId, reply)
+		raft.LogPrint(raft.INFO, dScClient, "C%d receive Join response from S%d ok %v reply %+v", ck.clientId, ck.leaderId, ok, reply)
 		if ok && !reply.WrongLeader {
 			return
 		}
@@ -138,7 +138,7 @@ func (ck *Clerk) Leave(gids []int) {
 		var reply LeaveReply
 		raft.LogPrint(raft.INFO, dScClient, "C%d send Leave request to S%d args %+v", ck.clientId, ck.leaderId, args)
 		ok := ck.servers[ck.leaderId].Call("ShardCtrler.Leave", args, &reply)
-		raft.LogPrint(raft.INFO, dScClient, "C%d receive Leave response to S%d reply %+v", ck.clientId, ck.leaderId, reply)
+		raft.LogPrint(raft.INFO, dScClient, "C%d receive Leave response from S%d ok %v reply %+v", ck.clientId, ck.leaderId, ok, reply)
 		if ok && !reply.WrongLeader {
 			return
 		}
@@ -177,7 +177,7 @@ func (ck *Clerk) Move(shard int, gid int) {
 		var reply MoveReply
 		raft.LogPrint(raft.INFO, dScClient, "C%d send Move request to S%d args %+v", ck.clientId, ck.leaderId, args)
 		ok := ck.servers[ck.leaderId].Call("ShardCtrler.Move", args, &reply)
-		raft.LogPrint(raft.INFO, dScClient, "C%d receive Move response to S%d reply %+v", ck.clientId, ck.leaderId, reply)
+		raft.LogPrint(raft.INFO, dScClient, "C%d receive Move response from S%d ok %v reply %+v", ck.clientId, ck.leaderId, ok, reply)
 		if ok && !reply.WrongLeader {
 			return
 		}

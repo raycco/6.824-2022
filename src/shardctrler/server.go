@@ -52,6 +52,7 @@ type OpCache struct {
 	Index  int
 	Opcode int
 	SeqId  int64
+	Err    Err
 }
 
 func (sc *ShardCtrler) buildReply(isLeader bool) OpReply {
@@ -77,8 +78,8 @@ func (sc *ShardCtrler) getFieldOfArgs(args interface{}, fieldName string) int64 
 
 func (sc *ShardCtrler) processRequest(op Op) OpReply {
 
-	raft.LogPrint(raft.INFO, dScServer, "S%d process request %+v", sc.me, op)
 	_, isLeader := sc.rf.GetState()
+	raft.LogPrint(raft.INFO, dScServer, "S%d leader=%v, process request %+v", sc.me, isLeader, op)
 	if !isLeader {
 		return sc.buildReply(false)
 	}
@@ -88,7 +89,8 @@ func (sc *ShardCtrler) processRequest(op Op) OpReply {
 
 	if op.Opcode != OP_QUERY {
 		opCache, ok := sc.clientop[clientid]
-		if ok && seqid < opCache.SeqId {
+		if ok && (seqid < opCache.SeqId ||
+			(seqid == opCache.SeqId && opCache.Err == OK)) {
 			return sc.buildReply(true)
 		}
 	}
@@ -97,7 +99,7 @@ func (sc *ShardCtrler) processRequest(op Op) OpReply {
 	if !isleader {
 		return sc.buildReply(false)
 	} else {
-		opCache := &OpCache{term, index, op.Opcode, seqid}
+		opCache := &OpCache{term, index, op.Opcode, seqid, Empty}
 		sc.clientop[clientid] = opCache
 
 		replyCh := make(chan OpReply)
@@ -190,19 +192,23 @@ func (sc *ShardCtrler) applier() {
 			if op.Opcode == OP_QUERY {
 				opReply = sc.opExecute(op, isLeader)
 				if seqid >= opCache.SeqId {
-					opCache = &OpCache{term, index, op.Opcode, seqid}
+					opCache = &OpCache{term, index, op.Opcode, seqid, Empty}
 				}
 			} else {
-				if seqid >= opCache.SeqId && index >= opCache.Index {
+				if (seqid > opCache.SeqId && index >= opCache.Index) || opCache.Err == Empty {
 					opReply = sc.opExecute(op, isLeader)
-					opCache = &OpCache{term, index, op.Opcode, seqid}
+					opCache = &OpCache{term, index, op.Opcode, seqid, opReply.Err}
 				} else {
 					opReply = sc.buildReply(isLeader)
 				}
 			}
 		} else {
 			opReply = sc.opExecute(op, isLeader)
-			opCache = &OpCache{term, index, op.Opcode, seqid}
+			if op.Opcode == OP_QUERY {
+				opCache = &OpCache{term, index, op.Opcode, seqid, Empty}
+			} else {
+				opCache = &OpCache{term, index, op.Opcode, seqid, opReply.Err}
+			}
 		}
 
 		sc.clientop[clientid] = opCache

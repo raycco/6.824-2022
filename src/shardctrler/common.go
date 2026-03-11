@@ -35,6 +35,7 @@ type Config struct {
 }
 
 const (
+	Empty          = ""
 	OK             = "OK"
 	ErrWrongLeader = "ErrWrongLeader"
 )

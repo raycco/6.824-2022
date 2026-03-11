@@ -19,6 +19,7 @@ const (
 	OP_APPEND  = 3
 	OP_MIGRATE = 4
 	OP_CONFIG  = 5
+	OP_DELETE  = 6
 )
 
 type KeyVal struct {
@@ -78,14 +79,12 @@ type ShardKV struct {
 	migrateStat       map[int]bool
 
 	migrateCond      *sync.Cond
-	migrateCh        chan int
 	migratingDb      map[string]string
 	migratingGrpKeys map[int][]string
 
 	migratingGidConfig map[int]Cfg
 
 	migratingCond *sync.Cond
-	cfgUpdateCond *sync.Cond
 
 	waitPushCount map[int]int // wait push count for each config version
 
@@ -215,7 +214,6 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 
 	kv.migrateCond = sync.NewCond(&kv.mu)
 	kv.migratingCond = sync.NewCond(&kv.mu)
-	kv.cfgUpdateCond = sync.NewCond(&kv.mu)
 	kv.waitPushCount = make(map[int]int)
 
 	kv.dbstat = kv.newDbStat()
@@ -235,25 +233,22 @@ func (kv *ShardKV) waitForMigrate(shard int, clientid int64, key string) {
 	for {
 		wait := false
 		if kv.config.Num > 1 {
-			//lastCfg := kv.cfgck.Query(kv.config.Num - 1)
+			kv.lastConfig = Cfg(kv.cfgck.Query(kv.config.Num - 1))
 			gid := kv.lastConfig.Shards[shard]
-			if kv.dbstat.Stat == MIGRATING && len(kv.migratingGidConfig) > 0 && gid != kv.gid {
+			raft.LogPrint(raft.INFO, dKvServer, "%s wait for migrate shard = %v, gid = %v, C%d, key = %v, lastConfig %+v",
+				kv.logPrefix, shard, gid, clientid, key, kv.lastConfig)
+			if (kv.dbstat.Stat == WAITING || kv.dbstat.Stat == MIGRATING) && len(kv.migratingGidConfig) > 0 && gid != kv.gid {
 				_, ok := kv.migratingGidConfig[gid]
 				_, exist := kv.migratingDb[key]
-				raft.LogPrint(raft.INFO, dKvServer, "%s wait for migrate shard = %v, gid = %v, C%d, key = %v, migratingGidConfig = %v, migratingDb = %v, lastConfig %+v",
-					kv.logPrefix, shard, gid, clientid, key, kv.migratingGidConfig, kv.migratingDb, kv.lastConfig)
+				raft.LogPrint(raft.INFO, dKvServer, "%s wait for migrate migratingGidConfig = %v, migratingDb = %v",
+					kv.logPrefix, kv.migratingGidConfig, kv.migratingDb)
 				if (!ok && !exist) || (ok && exist) {
 					wait = true
 				}
 			}
-
-			if kv.dbstat.Stat == WAITING && gid != kv.gid {
-				wait = true
-			}
 		}
 
-		if clientid == MIGRATE_CLIENT_ID || (kv.dbstat.Stat != WAITING && !wait) ||
-			(kv.dbstat.Stat == WAITING && wait) {
+		if clientid <= MIGRATE_CLIENT_ID || !wait {
 			break
 		}
 		kv.migratingCond.Wait()
@@ -420,6 +415,8 @@ func (kv *ShardKV) processOp(op Op, index int) {
 		opReply = kv.processConfigOp(op, term, index, isLeader)
 	case OP_MIGRATE:
 		opReply = kv.processMigrateOp(op, term, index, isLeader)
+	case OP_DELETE:
+		opReply = kv.processDeleteOp(op, term, index, isLeader)
 	case OP_NONE:
 		raft.LogPrint(raft.INFO, dKvServer, "%s no-op", kv.logPrefix)
 	default:
@@ -468,6 +465,8 @@ func (kv *ShardKV) resotreSnapshot(snapshot []byte, index int) {
 		raft.LogPrint(raft.ERROR, dKvServer, "%s snapshot is nil", kv.logPrefix)
 		return
 	}
+
+	raft.LogPrint(raft.INFO, dKvServer, "%s resotre snapshot size = %d", kv.logPrefix, len(snapshot))
 
 	byteBuffer := bytes.NewBuffer(snapshot)
 	decoder := labgob.NewDecoder(byteBuffer)
@@ -539,7 +538,7 @@ func (kv *ShardKV) resotreSnapshot(snapshot []byte, index int) {
 func (kv *ShardKV) createSnapshot(force bool) {
 	if kv.maxraftstate != -1 {
 		raftStateSize := kv.rf.GetRaftStateSize()
-		if raftStateSize-kv.lastRaftStateSize >= kv.maxraftstate || force {
+		if raftStateSize > kv.maxraftstate || force {
 			raft.LogPrint(raft.INFO, dKvServer, "%s RSS=%d LRSS=%d LII=%d",
 				kv.logPrefix, raftStateSize, kv.lastRaftStateSize, kv.lastIncludedIndex)
 			raft.LogPrint(raft.INFO, dKvServer, "%s database = %+v", kv.logPrefix, kv.database)

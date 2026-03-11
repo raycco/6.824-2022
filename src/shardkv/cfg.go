@@ -146,12 +146,6 @@ func (kv *ShardKV) configer() {
 				op.Opcode = OP_NONE
 				kv.rf.Start(op)
 			}
-			/*for {
-				if len(kv.migratingDb) <= 0 && kv.dbstat.Stat == SERVING {
-					break
-				}
-				kv.cfgUpdateCond.Wait()
-			}*/
 
 			if kv.dbstat.Config.Num == kv.config.Num {
 				if kv.dbstat.Stat == SERVING {
@@ -168,14 +162,6 @@ func (kv *ShardKV) configer() {
 
 						opCache := &OpCache{term, index, op.Opcode, kv.config.Num, op.SeqId, Empty}
 						kv.clientop[op.ClientId] = opCache
-
-						/*replyCh := make(chan OpReply)
-						kv.replyChs[index] = replyCh
-
-						kv.mu.Unlock()
-						<-replyCh
-						kv.migrateCond.Broadcast()
-						kv.mu.Lock()*/
 					}
 
 				} else if kv.dbstat.Stat == PUSHING {
@@ -198,6 +184,8 @@ func (kv *ShardKV) configer() {
 				raft.LogPrint(raft.INFO, dKvServer, "%s ticker config = %+v", kv.logPrefix, kv.config)
 				if kv.dbstat.Stat == CONFIGING {
 					dbstat := kv.newDbStat()
+					//var config Cfg
+					//config = Cfg(kv.cfgck.Query(kv.config.Num + 1))
 					dbstat.Config = kv.dbstat.Config.Copy()
 					dbstat.Stat = CONFIGING
 
