@@ -17,8 +17,8 @@ const (
 	ErrNoKey           = "ErrNoKey"
 	ErrWrongGroup      = "ErrWrongGroup"
 	ErrWrongLeader     = "ErrWrongLeader"
-	ErrDataMigrate     = "ErrDataMigrate"
-	ErrCfgExpired      = "ErrCfgExpired"
+	ErrConfigChange    = "ErrConfigChange"
+	ErrConfigExpired   = "ErrConfigExpired"
 	ErrMigrateComplete = "ErrMigrateComplete"
 	ErrMigrating       = "ErrMigrating"
 )
@@ -85,6 +85,17 @@ func removeKey(slice []string, key string) []string {
 	for i, v := range slice {
 		if v == key {
 			return append(slice[:i], slice[i+1:]...)
+		}
+	}
+	return slice
+}
+
+func removeShard(slice []int, shard int) []int {
+	for i := 0; i < len(slice); {
+		if slice[i] == shard {
+			slice = append(slice[:i], slice[i+1:]...)
+		} else {
+			i++
 		}
 	}
 	return slice
