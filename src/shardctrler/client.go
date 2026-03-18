@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"math/big"
 	"reflect"
+	"sync/atomic"
 	"time"
 
 	"6.824/labrpc"
@@ -24,6 +25,7 @@ type Clerk struct {
 	leaderId     int
 	currentSeqId int64
 	snowflake    *snowflake.Snowflake
+	dead         int32
 }
 
 func nrand() int64 {
@@ -53,6 +55,15 @@ func (ck *Clerk) GetClientId() int64 {
 	return ck.clientId
 }
 
+func (kv *Clerk) Kill() {
+	atomic.StoreInt32(&kv.dead, 1)
+}
+
+func (kv *Clerk) killed() bool {
+	z := atomic.LoadInt32(&kv.dead)
+	return z == 1
+}
+
 func (ck *Clerk) Query(num int) Config {
 	args := &QueryArgs{}
 	// Your code here.
@@ -62,10 +73,15 @@ func (ck *Clerk) Query(num int) Config {
 	args.SeqId = ck.currentSeqId
 	for {
 		var reply QueryReply
+
+		if ck.killed() {
+			return reply.Config
+		}
+
 		raft.LogPrint(raft.INFO, dScClient, "C%d send Query request to S%d args %+v", ck.clientId, ck.leaderId, args)
-		ok := ck.servers[ck.leaderId].Call("ShardCtrler.Query", args, &reply)
-		raft.LogPrint(raft.INFO, dScClient, "C%d receive Query response from S%d ok %v reply %+v", ck.clientId, ck.leaderId, ok, reply)
-		if ok && !reply.WrongLeader {
+		ok1 := ck.servers[ck.leaderId].Call("ShardCtrler.Query", args, &reply)
+		raft.LogPrint(raft.INFO, dScClient, "C%d receive Query response from S%d ok %v reply %+v", ck.clientId, ck.leaderId, ok1, reply)
+		if ok1 && !reply.WrongLeader {
 			return reply.Config
 		}
 		// try each known server.
@@ -74,8 +90,8 @@ func (ck *Clerk) Query(num int) Config {
 				continue
 			}
 			var reply QueryReply
-			ok := srv.Call("ShardCtrler.Query", args, &reply)
-			if ok && !reply.WrongLeader {
+			ok2 := srv.Call("ShardCtrler.Query", args, &reply)
+			if ok2 && !reply.WrongLeader {
 				ck.leaderId = svrid
 				return reply.Config
 			}
@@ -100,9 +116,9 @@ func (ck *Clerk) Join(servers map[int][]string) {
 	for {
 		var reply JoinReply
 		raft.LogPrint(raft.INFO, dScClient, "C%d send Join request to S%d args %+v", ck.clientId, ck.leaderId, args)
-		ok := ck.servers[ck.leaderId].Call("ShardCtrler.Join", args, &reply)
-		raft.LogPrint(raft.INFO, dScClient, "C%d receive Join response from S%d ok %v reply %+v", ck.clientId, ck.leaderId, ok, reply)
-		if ok && !reply.WrongLeader {
+		ok1 := ck.servers[ck.leaderId].Call("ShardCtrler.Join", args, &reply)
+		raft.LogPrint(raft.INFO, dScClient, "C%d receive Join response from S%d ok %v reply %+v", ck.clientId, ck.leaderId, ok1, reply)
+		if ok1 && !reply.WrongLeader {
 			return
 		}
 		// try each known server.
@@ -111,8 +127,8 @@ func (ck *Clerk) Join(servers map[int][]string) {
 				continue
 			}
 			var reply JoinReply
-			ok := srv.Call("ShardCtrler.Join", args, &reply)
-			if ok && !reply.WrongLeader {
+			ok2 := srv.Call("ShardCtrler.Join", args, &reply)
+			if ok2 && !reply.WrongLeader {
 				ck.leaderId = svrid
 				return
 			}
@@ -137,9 +153,9 @@ func (ck *Clerk) Leave(gids []int) {
 	for {
 		var reply LeaveReply
 		raft.LogPrint(raft.INFO, dScClient, "C%d send Leave request to S%d args %+v", ck.clientId, ck.leaderId, args)
-		ok := ck.servers[ck.leaderId].Call("ShardCtrler.Leave", args, &reply)
-		raft.LogPrint(raft.INFO, dScClient, "C%d receive Leave response from S%d ok %v reply %+v", ck.clientId, ck.leaderId, ok, reply)
-		if ok && !reply.WrongLeader {
+		ok1 := ck.servers[ck.leaderId].Call("ShardCtrler.Leave", args, &reply)
+		raft.LogPrint(raft.INFO, dScClient, "C%d receive Leave response from S%d ok %v reply %+v", ck.clientId, ck.leaderId, ok1, reply)
+		if ok1 && !reply.WrongLeader {
 			return
 		}
 
@@ -149,8 +165,8 @@ func (ck *Clerk) Leave(gids []int) {
 				continue
 			}
 			var reply LeaveReply
-			ok := srv.Call("ShardCtrler.Leave", args, &reply)
-			if ok && !reply.WrongLeader {
+			ok2 := srv.Call("ShardCtrler.Leave", args, &reply)
+			if ok2 && !reply.WrongLeader {
 				ck.leaderId = svrid
 				return
 			}
@@ -176,9 +192,9 @@ func (ck *Clerk) Move(shard int, gid int) {
 	for {
 		var reply MoveReply
 		raft.LogPrint(raft.INFO, dScClient, "C%d send Move request to S%d args %+v", ck.clientId, ck.leaderId, args)
-		ok := ck.servers[ck.leaderId].Call("ShardCtrler.Move", args, &reply)
-		raft.LogPrint(raft.INFO, dScClient, "C%d receive Move response from S%d ok %v reply %+v", ck.clientId, ck.leaderId, ok, reply)
-		if ok && !reply.WrongLeader {
+		ok1 := ck.servers[ck.leaderId].Call("ShardCtrler.Move", args, &reply)
+		raft.LogPrint(raft.INFO, dScClient, "C%d receive Move response from S%d ok %v reply %+v", ck.clientId, ck.leaderId, ok1, reply)
+		if ok1 && !reply.WrongLeader {
 			return
 		}
 		// try each known server.
@@ -187,8 +203,8 @@ func (ck *Clerk) Move(shard int, gid int) {
 				continue
 			}
 			var reply MoveReply
-			ok := srv.Call("ShardCtrler.Move", args, &reply)
-			if ok && !reply.WrongLeader {
+			ok2 := srv.Call("ShardCtrler.Move", args, &reply)
+			if ok2 && !reply.WrongLeader {
 				ck.leaderId = svrid
 				return
 			}

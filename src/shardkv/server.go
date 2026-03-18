@@ -76,11 +76,13 @@ type ShardKV struct {
 	lastIncludedIndex int
 	lastRaftStateSize int
 
-	migratingKeys []string
-
 	migratingCond *sync.Cond
 
 	migrateTasks map[int]MigrateTask
+
+	gidLeader map[int]int
+
+	state int
 
 	logPrefix string
 }
@@ -128,6 +130,7 @@ func (kv *ShardKV) Kill() {
 	kv.rf.Kill()
 	// Your code here, if desired.
 	atomic.StoreInt32(&kv.dead, 1)
+	kv.cfgck.Kill()
 	raft.LogPrint(raft.INFO, dKvServer, "%s killed", kv.logPrefix)
 }
 
@@ -202,6 +205,9 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.migratingCond = sync.NewCond(&kv.mu)
 
 	kv.migrateTasks = make(map[int]MigrateTask)
+	kv.gidLeader = make(map[int]int)
+
+	kv.state = ACTIVING
 
 	go kv.applier()
 
@@ -216,7 +222,9 @@ func (kv *ShardKV) waitForMigrate(shard int, clientid int64, key string) {
 	for {
 		wait := false
 		if kv.config.Num > 1 {
-			kv.lastConfig = Cfg(kv.cfgck.Query(kv.config.Num - 1))
+			if kv.lastConfig.Num != kv.config.Num-1 {
+				kv.lastConfig = Cfg(kv.cfgck.Query(kv.config.Num - 1))
+			}
 			gid := kv.lastConfig.Shards[shard]
 			raft.LogPrint(raft.INFO, dKvServer, "%s wait for migrate shard = %v, gid = %v, C%d, key = %v, lastConfig %+v",
 				kv.logPrefix, shard, gid, clientid, key, kv.lastConfig)
@@ -225,7 +233,10 @@ func (kv *ShardKV) waitForMigrate(shard int, clientid int64, key string) {
 				raft.LogPrint(raft.INFO, dKvServer, "%s wait for migrate sharddb %+v",
 					kv.logPrefix, shardDb)
 			}
-			if (ok && shardDb.LastKey != KEY_MAX && (shardDb.LastKey == KEY_MIN || shardDb.LastKey < key)) && gid != kv.gid {
+			if (ok &&
+				shardDb.LastKey != KEY_MAX &&
+				(shardDb.LastKey == KEY_MIN || shardDb.LastKey < key)) &&
+				gid != kv.gid {
 				wait = true
 			}
 		}
@@ -296,11 +307,6 @@ func (kv *ShardKV) opExecute(op Op) OpReply {
 		return OpReply{ErrWrongGroup, ""}
 	}
 
-	/*_, exist := kv.shardDbs[shard]
-	if !exist {
-		kv.shardDbs[shard] = NewShardDb()
-	}*/
-
 	switch op.Opcode {
 	case OP_GET:
 		_, ok := kv.shardDbs[shard].Get(key)
@@ -346,9 +352,13 @@ func (kv *ShardKV) processClientOp(op Op, term int, index int) OpReply {
 				kv.clientop[clientid] = opCache
 			}
 		} else {
+			// 若第一次执行是ErrWrongGroup，第二次执行时非leader的opCache.Err为ErrWrongGroup，导致数据不一致
 			if (seqid > opCache.SeqId && index >= opCache.Index) || opCache.Err == Empty {
 				opReply = kv.opExecute(op)
 				opCache = &OpCache{term, index, op.Opcode, kv.config.Num, seqid, opReply.Err}
+				if opCache.Err != OK {
+					opCache.Err = Empty
+				}
 				kv.clientop[clientid] = opCache
 			} else {
 				opReply = OpReply{OK, ""}
@@ -360,6 +370,9 @@ func (kv *ShardKV) processClientOp(op Op, term int, index int) OpReply {
 			opCache = &OpCache{term, index, op.Opcode, kv.config.Num, seqid, Empty}
 		} else {
 			opCache = &OpCache{term, index, op.Opcode, kv.config.Num, seqid, opReply.Err}
+			if opCache.Err != OK {
+				opCache.Err = Empty
+			}
 		}
 		kv.clientop[clientid] = opCache
 	}
@@ -511,7 +524,9 @@ func (kv *ShardKV) resotreSnapshot(snapshot []byte, index int) {
 	kv.shardDbs = shardDbs
 
 	raft.LogPrint(raft.INFO, dKvServer, "%s ingest kv config %+v", kv.logPrefix, kv.config)
-	raft.LogPrint(raft.INFO, dKvServer, "%s ingest kv database = %+v", kv.logPrefix, kv.shardDbs)
+	for shard, sharddb := range kv.shardDbs {
+		raft.LogPrint(raft.INFO, dKvServer, "%s ingest kvdb shard %d db %+v", kv.logPrefix, shard, sharddb)
+	}
 
 	raft.LogPrint(raft.INFO, dKvServer, "%s resotre snapshot LII=%d", kv.logPrefix, kv.lastIncludedIndex)
 }

@@ -72,9 +72,7 @@ func (kv *ShardKV) processConfigOp(op Op, term int, index int) OpReply {
 }
 
 func (kv *ShardKV) calcMigrateShards() (map[int]int, map[int]int) {
-	if kv.lastConfig.Num != kv.config.Num-1 {
-		kv.lastConfig = Cfg(kv.cfgck.Query(kv.config.Num - 1))
-	}
+
 	oldcfg := kv.lastConfig
 	newcfg := kv.config
 
@@ -104,33 +102,48 @@ func (kv *ShardKV) calcMigrateShards() (map[int]int, map[int]int) {
 	return srcShards, dstShards
 }
 
-func (kv *ShardKV) kvState() int {
-	srcShards, dstShards := kv.calcMigrateShards()
+func (kv *ShardKV) kvState() {
+
+	if kv.config.Num > 0 && kv.lastConfig.Num != kv.config.Num-1 {
+		kv.lastConfig = Cfg(kv.cfgck.Query(kv.config.Num - 1))
+	}
+
+	oldcfg := kv.lastConfig
+	newcfg := kv.config
+
 	for shard, db := range kv.shardDbs {
-		_, ok1 := srcShards[shard]
-		if ok1 && db.LastKey != KEY_MAX {
-			return MIGRATING
+		if kv.gid == newcfg.Shards[shard] && db.LastKey != KEY_MAX {
+			kv.state = MIGRATING
+			return
 		}
 
-		_, ok2 := dstShards[shard]
-		if ok2 && db.LastKey != KEY_MAX {
-			return PUSHING
+		if kv.gid == oldcfg.Shards[shard] && db.LastKey != KEY_MAX {
+			kv.state = PUSHING
+			return
 		}
 	}
 
-	return SERVING
+	kv.state = SERVING
 }
 
 func (kv *ShardKV) configer() {
 	for !kv.killed() {
-
 		kv.mu.Lock()
 
 		_, isLeader := kv.rf.GetState()
 		if isLeader {
-			state := kv.kvState()
-			//raft.LogPrint(raft.INFO, dKvServer, "%s configer num = %d, state = %d", kv.logPrefix, kv.config.Num, state)
-			switch state {
+			if kv.state == ACTIVING {
+				// 102-S0 log index 265即将shard的LastKey设置为KEY_MAX，
+				// 但是102-S1与102-S2 commit index到264，此时kill server，
+				// 重启后leader变为S1，265不会apply，102一直处于MIGRATING
+				kv.state = SERVING
+				var op Op
+				op.Opcode = OP_NONE
+				kv.startOp(op)
+			}
+
+			kv.kvState()
+			switch kv.state {
 			case SERVING:
 				newcfg := kv.cfgck.Query(kv.config.Num + 1)
 				if newcfg.Num == kv.config.Num+1 {
@@ -141,17 +154,8 @@ func (kv *ShardKV) configer() {
 			case PUSHING:
 				_, dstShards := kv.calcMigrateShards()
 				if len(dstShards) > 0 {
-					for {
-						success := kv.shardsMigrate(MODE_PUSH, dstShards)
-						if success {
-							break
-						}
-						time.Sleep(100 * time.Millisecond)
-					}
-				} else {
-
+					kv.shardsMigrate(MODE_PUSH, dstShards)
 				}
-
 			case MIGRATING:
 				raft.LogPrint(raft.INFO, dKvServer, "%s num = %d MIGRATING", kv.logPrefix, kv.config.Num)
 			}

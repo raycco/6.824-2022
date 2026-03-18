@@ -17,9 +17,9 @@ const (
 	ErrNoKey           = "ErrNoKey"
 	ErrWrongGroup      = "ErrWrongGroup"
 	ErrWrongLeader     = "ErrWrongLeader"
-	ErrConfigChange    = "ErrConfigChange"
-	ErrConfigExpired   = "ErrConfigExpired"
+	ErrReplyLost       = "ErrReplyLost"
 	ErrMigrateComplete = "ErrMigrateComplete"
+	ErrConfigChange    = "ErrConfigChange"
 	ErrMigrating       = "ErrMigrating"
 )
 
