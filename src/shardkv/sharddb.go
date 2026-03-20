@@ -4,6 +4,11 @@ import (
 	"sort"
 )
 
+const (
+	KEY_MIN = "-"
+	KEY_MAX = "="
+)
+
 type ShardDb struct {
 	KvData  map[string]string
 	Keys    []string
@@ -66,6 +71,22 @@ func (db *ShardDb) Ascend(f func(key string, value string) bool) {
 			break
 		}
 	}
+}
+
+func (db *ShardDb) IsLastKeyMax() bool {
+	return db.LastKey == KEY_MAX
+}
+
+func (db *ShardDb) IsLastKeyMin() bool {
+	return db.LastKey == KEY_MIN
+}
+
+func (db *ShardDb) SetLastKey(key string) {
+	db.LastKey = key
+}
+
+func (db *ShardDb) GetLastKey() string {
+	return db.LastKey
 }
 
 // From 返回从指定 key 开始（包括该 key）的 n 个键值对。

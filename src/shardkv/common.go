@@ -18,14 +18,30 @@ const (
 	ErrWrongGroup      = "ErrWrongGroup"
 	ErrWrongLeader     = "ErrWrongLeader"
 	ErrReplyLost       = "ErrReplyLost"
+	ErrOpNotSupport    = "ErrOpNotSupport"
 	ErrMigrateComplete = "ErrMigrateComplete"
 	ErrConfigChange    = "ErrConfigChange"
-	ErrMigrating       = "ErrMigrating"
+	ErrDataMigrate     = "ErrDataMigrate"
 )
 
 const (
 	dKvServer raft.LogTopic = "KVSR"
 	dKvClient raft.LogTopic = "KVCL"
+)
+
+type KeyVal struct {
+	Key   string
+	Value string
+}
+
+const (
+	OP_NONE    = 0
+	OP_GET     = 1
+	OP_PUT     = 2
+	OP_APPEND  = 3
+	OP_MIGRATE = 4
+	OP_CONFIG  = 5
+	OP_DELETE  = 6
 )
 
 const (
@@ -37,6 +53,18 @@ const (
 	PULLING   = 0x20
 	MIGRATING = 0x40
 	DELETING  = 0x80
+)
+
+const (
+	MIGRATE_CLIENT_ID = -1
+	CONFIG_CLIENT_ID  = -2
+	DELETE_CLIENT_ID  = -3
+)
+
+const (
+	MODE_UNKNOWN = iota
+	MODE_PUSH
+	MODE_PULL
 )
 
 type Err string
