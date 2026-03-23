@@ -48,7 +48,7 @@ type Clerk struct {
 	clientId     int64
 	currentSeqId int64
 	snowflake    *snowflake.Snowflake
-	grpLeaderId  map[int]int
+	//grpLeaderId  map[int]int
 }
 
 // the tester calls MakeClerk.
@@ -71,7 +71,7 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 		panic(err)
 	}
 	ck.currentSeqId = ck.snowflake.NextID()
-	ck.grpLeaderId = make(map[int]int)
+	//ck.grpLeaderId = make(map[int]int)
 	return ck
 }
 
@@ -92,27 +92,15 @@ func (ck *Clerk) Get(key string) string {
 		gid := ck.config.Shards[shard]
 		args.Num = ck.config.Num
 		if servers, ok := ck.config.Groups[gid]; ok {
-			srv := ck.make_end(servers[ck.grpLeaderId[gid]])
-			var reply GetReply
-			ok := srv.Call("ShardKV.Get", &args, &reply)
-			raft.LogPrint(raft.INFO, dKvClient, "C%d G%d recv Get response from S%d args %+v reply %+v",
-				ck.clientId, gid, ck.grpLeaderId[gid], args, reply)
-			if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
-				return reply.Value
-			}
 
 			// try each server for the shard.
 			for si := 0; si < len(servers); si++ {
-				if si == ck.grpLeaderId[gid] {
-					continue
-				}
 				srv := ck.make_end(servers[si])
 				var reply GetReply
 				ok := srv.Call("ShardKV.Get", &args, &reply)
-				raft.LogPrint(raft.INFO, dKvClient, "C%d G%d recv Get response from S%d args %+v reply %+v",
-					ck.clientId, gid, si, args, reply)
+				raft.LogPrint(raft.INFO, dKvClient, "C%d recv Get response %v from G%d-S%d args %+v reply %+v",
+					ck.clientId, ok, gid, si, args, reply)
 				if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
-					ck.grpLeaderId[gid] = si
 					return reply.Value
 				}
 				if ok && (reply.Err == ErrWrongGroup) {
@@ -146,26 +134,13 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		gid := ck.config.Shards[shard]
 		args.Num = ck.config.Num
 		if servers, ok := ck.config.Groups[gid]; ok {
-			srv := ck.make_end(servers[ck.grpLeaderId[gid]])
-			var reply PutAppendReply
-			ok := srv.Call("ShardKV.PutAppend", &args, &reply)
-			raft.LogPrint(raft.INFO, dKvClient, "C%d G%d recv Put/Append response from S%d args %+v reply %+v",
-				ck.clientId, gid, ck.grpLeaderId[gid], args, reply)
-			if ok && reply.Err == OK {
-				return
-			}
-
 			for si := 0; si < len(servers); si++ {
-				if si == ck.grpLeaderId[gid] {
-					continue
-				}
 				srv := ck.make_end(servers[si])
 				var reply PutAppendReply
 				ok := srv.Call("ShardKV.PutAppend", &args, &reply)
-				raft.LogPrint(raft.INFO, dKvClient, "C%d G%d recv Put/Append response from S%d args %+v reply %+v",
-					ck.clientId, gid, si, args, reply)
+				raft.LogPrint(raft.INFO, dKvClient, "C%d recv PutAppend response %v from G%d-S%d args %+v reply %+v",
+					ck.clientId, ok, gid, si, args, reply)
 				if ok && reply.Err == OK {
-					ck.grpLeaderId[gid] = si
 					return
 				}
 				if ok && reply.Err == ErrWrongGroup {

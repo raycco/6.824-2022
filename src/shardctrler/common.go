@@ -38,6 +38,7 @@ const (
 	Empty          = ""
 	OK             = "OK"
 	ErrWrongLeader = "ErrWrongLeader"
+	ErrTimeOut     = "ErrTimeOut"
 )
 
 type Err string

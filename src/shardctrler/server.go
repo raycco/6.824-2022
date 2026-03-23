@@ -5,11 +5,14 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"6.824/labgob"
 	"6.824/labrpc"
 	"6.824/raft"
 )
+
+const OpProcessTimeOut = 2000 * time.Millisecond
 
 type ShardCtrler struct {
 	mu      sync.Mutex
@@ -104,9 +107,15 @@ func (sc *ShardCtrler) processRequest(op Op) OpReply {
 
 		replyCh := make(chan OpReply)
 		sc.replyChs[index] = replyCh
+		var opReply OpReply
 
 		sc.mu.Unlock()
-		opReply := <-replyCh
+		select {
+		case opReply = <-replyCh:
+		case <-time.After(OpProcessTimeOut):
+			opReply.Err = ErrTimeOut
+		}
+
 		raft.LogPrint(raft.INFO, dScServer, "S%d send response to C%d reply %+v", sc.me, clientid, opReply)
 		sc.mu.Lock()
 		return opReply
@@ -214,7 +223,8 @@ func (sc *ShardCtrler) applier() {
 		sc.clientop[clientid] = opCache
 
 		if isLeader {
-			if replyCh, ok := sc.replyChs[index]; ok && replyCh != nil {
+			replyCh, chok := sc.replyChs[index]
+			if chok && opCache.Index == index && replyCh != nil {
 				sc.mu.Unlock()
 				replyCh <- opReply
 				sc.mu.Lock()

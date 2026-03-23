@@ -5,12 +5,15 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"6.824/labgob"
 	"6.824/labrpc"
 	"6.824/raft"
 	"6.824/shardctrler"
 )
+
+const OpProcessTimeOut = 800 * time.Millisecond
 
 type Op struct {
 	// Your definitions here.
@@ -338,11 +341,17 @@ func (kv *ShardKV) processClientOp(op Op, index int) OpReply {
 				kv.clientOp[cliId] = &OpCache{index, op.Opcode, kv.currCfg.Num, seqId, Empty}
 			}
 		} else {
-			// 若第一次执行是ErrWrongGroup，第二次执行时非leader的opCache.Err为ErrWrongGroup，导致数据不一致
+			// 此处有一个问题待解决
+			// index 43 apply完执行产生snapshot，但是index 44已经apply并回复给client，
+			// client发送下一个append请求，将op提交给raft，index为45，此时op cache中
+			// 为index 45，然后restore snapshot回退index到43，重新apply index 44，
+			// 由于index 44 < op cache index 45，但是op cache err为空，则会执行index 44，
+			// 导致index 44的数据重复执行
 			if (seqId > opCache.SeqId && index >= opCache.Index) || opCache.Err == Empty {
 				opReply = kv.opExecute(op)
 				opCache = &OpCache{index, op.Opcode, kv.currCfg.Num, seqId, opReply.Err}
 				if opCache.Err != OK {
+					// 若第一次执行是ErrWrongGroup，第二次执行时非leader的opCache.Err为ErrWrongGroup，导致数据不一致
 					opCache.Err = Empty
 				}
 				kv.clientOp[cliId] = opCache
@@ -409,7 +418,9 @@ func (kv *ShardKV) processOp(op Op, index int) {
 	}
 
 	if isLeader {
-		if replyCh, ok := kv.replyChs[index]; ok && replyCh != nil {
+		opCache, cacheok := kv.clientOp[op.ClientId]
+		replyCh, chok := kv.replyChs[index]
+		if cacheok && chok && opCache.Index == index && replyCh != nil {
 			kv.mu.Unlock()
 			replyCh <- opReply
 			kv.mu.Lock()
@@ -574,7 +585,13 @@ func (kv *ShardKV) startOp(op Op) OpReply {
 		kv.replyChs[index] = replyCh
 
 		kv.mu.Unlock()
-		opReply = <-replyCh
+		// index 5已经timeout，目前replyCh是index 6，apply却是index 5，此时向index 5写入数据阻塞
+		// 在applier中需要判断index是否匹配
+		select {
+		case opReply = <-replyCh:
+		case <-time.After(OpProcessTimeOut):
+			opReply.Err = ErrOpTimeOut
+		}
 		kv.mu.Lock()
 	}
 	raft.LogPrint(raft.INFO, dKvServer, "%s end op reply %+v", kv.logPrefix, opReply)

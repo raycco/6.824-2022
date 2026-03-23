@@ -315,11 +315,30 @@ func (kv *ShardKV) doProgress(shard int, num int) {
 	}
 }
 
+func (kv *ShardKV) startMigrateOp(key string, value string, cliSeq map[int64]int64) bool {
+
+	op := Op{
+		Opcode:   OP_MIGRATE,
+		Num:      kv.currCfg.Num,
+		ClientId: MIGRATE_CLIENT_ID,
+		SeqId:    int64(kv.currCfg.Num),
+		Type:     Migrate{key, value, cliSeq},
+	}
+	raft.LogPrint(raft.INFO, dKvServer, "%s migrate op = %+v", kv.logPrefix, op)
+	opReply := kv.startOp(op)
+	raft.LogPrint(raft.INFO, dKvServer, "%s migrate op reply = %+v", kv.logPrefix, opReply)
+	if opReply.Err != OK {
+		return false
+	}
+	return true
+}
+
 func (kv *ShardKV) migrater() {
 
 	for !kv.killed() {
 		kv.mu.Lock()
 
+		var ok bool
 		for shard, task := range kv.migrateTasks {
 
 			keys := make([]string, 0)
@@ -328,33 +347,23 @@ func (kv *ShardKV) migrater() {
 			}
 			sort.Strings(keys)
 
-			op := Op{OP_MIGRATE, kv.currCfg.Num, MIGRATE_CLIENT_ID,
-				int64(kv.currCfg.Num), Migrate{KEY_MIN, strconv.Itoa(shard), task.cliSeq}}
-			raft.LogPrint(raft.INFO, dKvServer, "%s migrate op = %+v", kv.logPrefix, op)
-			opReply := kv.startOp(op)
-			raft.LogPrint(raft.INFO, dKvServer, "%s migrate op reply = %+v", kv.logPrefix, opReply)
+			ok = kv.startMigrateOp(KEY_MIN, strconv.Itoa(shard), task.cliSeq)
 
 			for _, key := range keys {
-				op = Op{OP_MIGRATE, kv.currCfg.Num, MIGRATE_CLIENT_ID,
-					int64(kv.currCfg.Num), Migrate{key, task.kvData[key], nil}}
-				raft.LogPrint(raft.INFO, dKvServer, "%s migrate op = %+v", kv.logPrefix, op)
-				opReply = kv.startOp(op)
-				raft.LogPrint(raft.INFO, dKvServer, "%s migrate op reply = %+v", kv.logPrefix, opReply)
-
+				ok = kv.startMigrateOp(key, task.kvData[key], nil)
 				kv.migratingCond.Broadcast()
+				if !ok {
+					break
+				}
 			}
 
-			op = Op{OP_MIGRATE, kv.currCfg.Num, MIGRATE_CLIENT_ID,
-				int64(kv.currCfg.Num), Migrate{KEY_MAX, strconv.Itoa(shard), nil}}
-			raft.LogPrint(raft.INFO, dKvServer, "%s migrate op = %+v", kv.logPrefix, op)
-			opReply = kv.startOp(op)
-			raft.LogPrint(raft.INFO, dKvServer, "%s migrate op reply = %+v", kv.logPrefix, opReply)
-
-			// 有可能leader切换，此时不能更新进度
-			if opReply.Err == OK {
-				kv.doProgress(shard, task.num)
+			if ok {
+				ok = kv.startMigrateOp(KEY_MAX, strconv.Itoa(shard), nil)
+				// 有可能leader切换，迁移失败，此时不能更新进度
+				if ok {
+					kv.doProgress(shard, task.num)
+				}
 			}
-
 			delete(kv.migrateTasks, shard)
 		}
 		kv.mu.Unlock()
