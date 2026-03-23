@@ -85,10 +85,6 @@ func (kv *ShardKV) doMigrateOp(op Op, index int, migrate Migrate) OpReply {
 				kv.clientOp[cliId] = &OpCache{index, OP_PUT, kv.currCfg.Num, seqId, OK}
 			}
 		}
-
-		if migrate.Key == KEY_MAX {
-			kv.migratingCond.Broadcast()
-		}
 	} else {
 		op.Type = KeyVal{migrate.Key, migrate.Value}
 		opReply = kv.opExecute(op)
@@ -351,7 +347,6 @@ func (kv *ShardKV) migrater() {
 
 			for _, key := range keys {
 				ok = kv.startMigrateOp(key, task.kvData[key], nil)
-				kv.migratingCond.Broadcast()
 				if !ok {
 					break
 				}

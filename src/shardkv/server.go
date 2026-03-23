@@ -63,8 +63,6 @@ type ShardKV struct {
 	lastIncludedIndex int
 	lastRaftStateSize int
 
-	migratingCond *sync.Cond
-
 	migrateTasks map[int]MigrateTask
 
 	gidLeaderId map[int]int
@@ -189,8 +187,6 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.lastIncludedIndex = 0
 	kv.lastRaftStateSize = kv.rf.GetRaftStateSize()
 
-	kv.migratingCond = sync.NewCond(&kv.mu)
-
 	kv.migrateTasks = make(map[int]MigrateTask)
 	kv.gidLeaderId = make(map[int]int)
 
@@ -205,33 +201,32 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	return kv
 }
 
-func (kv *ShardKV) waitForMigrate(shard int, clientid int64, key string) {
-	for {
-		wait := false
-		if kv.currCfg.Num > 1 {
-			if kv.lastCfg.Num != kv.currCfg.Num-1 {
-				kv.lastCfg = Cfg(kv.cfgck.Query(kv.currCfg.Num - 1))
-			}
-			gid := kv.lastCfg.Shards[shard]
-			raft.LogPrint(raft.INFO, dKvServer, "%s wait for migrate shard %v, gid %v, C%d, key %v, last config %+v",
-				kv.logPrefix, shard, gid, clientid, key, kv.lastCfg.Shards)
-			db, ok := kv.shardDbs[shard]
-			if ok {
-				raft.LogPrint(raft.INFO, dKvServer, "%s wait for migrate shard db %+v",
-					kv.logPrefix, db)
-			}
-			if gid != kv.gid {
-				if !ok || (ok && db.GetLastKey() < key) {
-					wait = true
-				}
-			}
-		}
+func (kv *ShardKV) isNeedWaitForMigrate(shard int, clientid int64, key string) bool {
 
-		if clientid <= MIGRATE_CLIENT_ID || !wait {
-			break
+	isNeedWait := false
+	if kv.currCfg.Num > 1 {
+		if kv.lastCfg.Num != kv.currCfg.Num-1 {
+			kv.lastCfg = Cfg(kv.cfgck.Query(kv.currCfg.Num - 1))
 		}
-		kv.migratingCond.Wait()
+		gid := kv.lastCfg.Shards[shard]
+		raft.LogPrint(raft.INFO, dKvServer, "%s wait for migrate shard %v, gid %v, C%d, key %v, last config %+v",
+			kv.logPrefix, shard, gid, clientid, key, kv.lastCfg.Shards)
+		db, ok := kv.shardDbs[shard]
+		if ok {
+			raft.LogPrint(raft.INFO, dKvServer, "%s wait for migrate shard db %+v", kv.logPrefix, db)
+		}
+		if gid != kv.gid {
+			if !ok || (ok && db.GetLastKey() < key) {
+				isNeedWait = true
+			}
+		}
 	}
+
+	if clientid <= MIGRATE_CLIENT_ID || !isNeedWait {
+		return false
+	}
+	return true
+
 }
 
 func (kv *ShardKV) isWrongGroup(num int, gid int) bool {
@@ -265,7 +260,9 @@ func (kv *ShardKV) processRequest(op Op) OpReply {
 		return OpReply{ErrWrongLeader, ""}
 	}
 
-	kv.waitForMigrate(shard, op.ClientId, key)
+	if kv.isNeedWaitForMigrate(shard, op.ClientId, key) {
+		return OpReply{ErrWaitMigrate, ""}
+	}
 
 	if op.Opcode != OP_GET {
 		opCache, ok := kv.clientOp[op.ClientId]

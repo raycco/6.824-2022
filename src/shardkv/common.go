@@ -17,6 +17,7 @@ const (
 	ErrNoKey           = "ErrNoKey"
 	ErrWrongGroup      = "ErrWrongGroup"
 	ErrWrongLeader     = "ErrWrongLeader"
+	ErrWaitMigrate     = "ErrWaitMigrate"
 	ErrReplyLost       = "ErrReplyLost"
 	ErrOpTimeOut       = "ErrOpTimeOut"
 	ErrOpNotSupport    = "ErrOpNotSupport"

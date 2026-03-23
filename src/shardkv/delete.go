@@ -12,7 +12,6 @@ func (kv *ShardKV) processDeleteOp(op Op, index int) OpReply {
 		if op.Num >= kv.currCfg.Num {
 			delete(kv.shardDbs, shard)
 		}
-		kv.migratingCond.Broadcast()
 		raft.LogPrint(raft.INFO, dKvServer, "%s index %d num %d database %v",
 			kv.logPrefix, index, kv.currCfg.Num, kv.shardDbs)
 		return OpReply{}
