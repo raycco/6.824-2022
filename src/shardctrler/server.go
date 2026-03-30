@@ -27,7 +27,7 @@ type ShardCtrler struct {
 
 	lastApplied int
 
-	clientop map[int64]*OpCache   // client id -> last op
+	clientOp map[int64]*OpCache   // client id -> last op
 	replyChs map[int]chan OpReply // index -> reply channel
 }
 
@@ -45,30 +45,15 @@ type Op struct {
 }
 
 type OpReply struct {
-	WrongLeader bool
-	Err         Err
-	Config      Config
+	Err    Err
+	Config Config
 }
 
 type OpCache struct {
-	Term   int
 	Index  int
 	Opcode int
 	SeqId  int64
 	Err    Err
-}
-
-func (sc *ShardCtrler) buildReply(isLeader bool) OpReply {
-	var opReply OpReply
-	if !isLeader {
-		opReply.WrongLeader = true
-		opReply.Err = ErrWrongLeader
-	} else {
-		opReply.WrongLeader = false
-		opReply.Err = OK
-	}
-
-	return opReply
 }
 
 func (sc *ShardCtrler) getFieldOfArgs(args interface{}, fieldName string) int64 {
@@ -84,40 +69,40 @@ func (sc *ShardCtrler) processRequest(op Op) OpReply {
 	_, isLeader := sc.rf.GetState()
 	raft.LogPrint(raft.INFO, dScServer, "S%d leader=%v, process request %+v", sc.me, isLeader, op)
 	if !isLeader {
-		return sc.buildReply(false)
+		return OpReply{Err: ErrWrongLeader}
 	}
 
-	clientid := sc.getFieldOfArgs(op.Args, "ClientId")
-	seqid := sc.getFieldOfArgs(op.Args, "SeqId")
+	cliId := sc.getFieldOfArgs(op.Args, FieldClientId)
+	seqId := sc.getFieldOfArgs(op.Args, FieldSeqId)
 
 	if op.Opcode != OP_QUERY {
-		opCache, ok := sc.clientop[clientid]
-		if ok && (seqid < opCache.SeqId ||
-			(seqid == opCache.SeqId && opCache.Err == OK)) {
-			return sc.buildReply(true)
+		opCache, ok := sc.clientOp[cliId]
+		if ok && (seqId < opCache.SeqId ||
+			(seqId == opCache.SeqId && opCache.Err == OK)) {
+			return OpReply{Err: OK}
 		}
 	}
 
-	index, term, isleader := sc.rf.Start(op)
+	index, _, isleader := sc.rf.Start(op)
 	if !isleader {
-		return sc.buildReply(false)
+		return OpReply{Err: ErrWrongLeader}
 	} else {
-		opCache := &OpCache{term, index, op.Opcode, seqid, Empty}
-		sc.clientop[clientid] = opCache
+		opCache := &OpCache{index, op.Opcode, seqId, Empty}
+		sc.clientOp[cliId] = opCache
 
-		replyCh := make(chan OpReply)
+		replyCh := make(chan OpReply, 1)
 		sc.replyChs[index] = replyCh
 		var opReply OpReply
-
 		sc.mu.Unlock()
+
 		select {
 		case opReply = <-replyCh:
 		case <-time.After(OpProcessTimeOut):
 			opReply.Err = ErrTimeOut
 		}
 
-		raft.LogPrint(raft.INFO, dScServer, "S%d send response to C%d reply %+v", sc.me, clientid, opReply)
 		sc.mu.Lock()
+		raft.LogPrint(raft.INFO, dScServer, "S%d send response to C%d reply %+v", sc.me, cliId, opReply)
 		return opReply
 	}
 }
@@ -130,7 +115,6 @@ func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 	raft.LogPrint(raft.INFO, dScServer, "S%d receive Join request from C%d args %+v", sc.me, args.ClientId, args)
 	op := Op{OP_JOIN, *args}
 	opReply := sc.processRequest(op)
-	reply.WrongLeader = opReply.WrongLeader
 	reply.Err = opReply.Err
 }
 
@@ -142,7 +126,6 @@ func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
 	raft.LogPrint(raft.INFO, dScServer, "S%d receive Leave request from C%d args %+v", sc.me, args.ClientId, args)
 	op := Op{OP_LEAVE, *args}
 	opReply := sc.processRequest(op)
-	reply.WrongLeader = opReply.WrongLeader
 	reply.Err = opReply.Err
 }
 
@@ -154,7 +137,6 @@ func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
 	raft.LogPrint(raft.INFO, dScServer, "S%d receive Move request from C%d args %+v", sc.me, args.ClientId, args)
 	op := Op{OP_MOVE, *args}
 	opReply := sc.processRequest(op)
-	reply.WrongLeader = opReply.WrongLeader
 	reply.Err = opReply.Err
 }
 
@@ -166,7 +148,6 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 	raft.LogPrint(raft.INFO, dScServer, "S%d receive Query request from C%d args %+v", sc.me, args.ClientId, args)
 	op := Op{OP_QUERY, *args}
 	opReply := sc.processRequest(op)
-	reply.WrongLeader = opReply.WrongLeader
 	reply.Err = opReply.Err
 	reply.Config.Num = opReply.Config.Num
 	reply.Config.Shards = opReply.Config.Shards
@@ -190,37 +171,37 @@ func (sc *ShardCtrler) applier() {
 
 		op := applyMsg.Command.(Op)
 		index := applyMsg.CommandIndex
-		term, isLeader := sc.rf.GetState()
+		_, isLeader := sc.rf.GetState()
 
 		var opReply OpReply
-		clientid := sc.getFieldOfArgs(op.Args, "ClientId")
-		seqid := sc.getFieldOfArgs(op.Args, "SeqId")
+		cliId := sc.getFieldOfArgs(op.Args, FieldClientId)
+		seqId := sc.getFieldOfArgs(op.Args, FieldSeqId)
 
-		opCache, ok := sc.clientop[clientid]
+		opCache, ok := sc.clientOp[cliId]
 		if ok {
 			if op.Opcode == OP_QUERY {
-				opReply = sc.opExecute(op, isLeader)
-				if seqid >= opCache.SeqId {
-					opCache = &OpCache{term, index, op.Opcode, seqid, Empty}
+				opReply = sc.opExecute(op)
+				if seqId >= opCache.SeqId {
+					opCache = &OpCache{index, op.Opcode, seqId, Empty}
 				}
 			} else {
-				if (seqid > opCache.SeqId && index >= opCache.Index) || opCache.Err == Empty {
-					opReply = sc.opExecute(op, isLeader)
-					opCache = &OpCache{term, index, op.Opcode, seqid, opReply.Err}
+				if (seqId > opCache.SeqId && index >= opCache.Index) || opCache.Err == Empty {
+					opReply = sc.opExecute(op)
+					opCache = &OpCache{index, op.Opcode, seqId, opReply.Err}
 				} else {
-					opReply = sc.buildReply(isLeader)
+					opReply.Err = OK
 				}
 			}
 		} else {
-			opReply = sc.opExecute(op, isLeader)
+			opReply = sc.opExecute(op)
 			if op.Opcode == OP_QUERY {
-				opCache = &OpCache{term, index, op.Opcode, seqid, Empty}
+				opCache = &OpCache{index, op.Opcode, seqId, Empty}
 			} else {
-				opCache = &OpCache{term, index, op.Opcode, seqid, opReply.Err}
+				opCache = &OpCache{index, op.Opcode, seqId, opReply.Err}
 			}
 		}
 
-		sc.clientop[clientid] = opCache
+		sc.clientOp[cliId] = opCache
 
 		if isLeader {
 			replyCh, chok := sc.replyChs[index]
@@ -238,9 +219,9 @@ func (sc *ShardCtrler) applier() {
 	}
 }
 
-func (sc *ShardCtrler) opExecute(op Op, isLeader bool) OpReply {
+func (sc *ShardCtrler) opExecute(op Op) OpReply {
 
-	opReply := sc.buildReply(isLeader)
+	opReply := OpReply{Err: OK}
 	switch op.Opcode {
 	case OP_JOIN:
 		args := op.Args.(JoinArgs)
@@ -260,7 +241,7 @@ func (sc *ShardCtrler) opExecute(op Op, isLeader bool) OpReply {
 
 	default:
 		raft.LogPrint(raft.ERROR, dScServer, "S%d unknown operation")
-		opReply = OpReply{}
+		opReply.Err = ErrUnsupport
 	}
 
 	return opReply
@@ -581,7 +562,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 	sc.rf = raft.Make(servers, me, persister, sc.applyCh)
 
 	// Your code here.
-	sc.clientop = make(map[int64]*OpCache)
+	sc.clientOp = make(map[int64]*OpCache)
 	sc.replyChs = make(map[int]chan OpReply)
 	sc.lastApplied = 0
 

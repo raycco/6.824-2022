@@ -39,6 +39,7 @@ const (
 	OK             = "OK"
 	ErrWrongLeader = "ErrWrongLeader"
 	ErrTimeOut     = "ErrTimeOut"
+	ErrUnsupport   = "ErrUnsupport"
 )
 
 type Err string
@@ -48,66 +49,69 @@ const (
 	dScClient raft.LogTopic = "SCCL"
 )
 
+const OP_PREFIX = "ShardCtrler."
+
+const (
+	OP_QUERY_STR = "Query"
+	OP_JOIN_STR  = "Join"
+	OP_LEAVE_STR = "Leave"
+	OP_MOVE_STR  = "Move"
+)
+
+const FieldClientId = "ClientId"
+const FieldSeqId = "SeqId"
+
 type CommonArgs struct {
 	ClientId int64
 	SeqId    int64
 }
 
-type JoinArgs struct {
-	Servers map[int][]string // new GID -> servers mappings
-
-	ClientId int64
-	SeqId    int64
+type CommonReply interface {
+	GetErr() Err
 }
 
-type JoinReply struct {
-	WrongLeader bool
-	Err         Err
+type JoinArgs struct {
+	Servers map[int][]string // new GID -> servers mappings
+	CommonArgs
 }
 
 type LeaveArgs struct {
 	GIDs []int
-
-	ClientId int64
-	SeqId    int64
-}
-
-type LeaveReply struct {
-	WrongLeader bool
-	Err         Err
+	CommonArgs
 }
 
 type MoveArgs struct {
 	Shard int
 	GID   int
-
-	ClientId int64
-	SeqId    int64
-}
-
-type MoveReply struct {
-	WrongLeader bool
-	Err         Err
+	CommonArgs
 }
 
 type QueryArgs struct {
 	Num int // desired config number
+	CommonArgs
+}
 
-	ClientId int64
-	SeqId    int64
+type JoinReply struct {
+	Err Err
+}
+
+type LeaveReply struct {
+	Err Err
+}
+
+type MoveReply struct {
+	Err Err
 }
 
 type QueryReply struct {
-	WrongLeader bool
-	Err         Err
-	Config      Config
+	Err    Err
+	Config Config
 }
 
-type Reply struct {
-	WrongLeader bool
-	Err         Err
-	Config      Config
-}
+func (r QueryReply) GetErr() Err { return r.Err }
+func (r JoinReply) GetErr() Err  { return r.Err }
+func (r LeaveReply) GetErr() Err { return r.Err }
+func (r MoveReply) GetErr() Err  { return r.Err }
 
 type GidShards struct {
 	gid    int
