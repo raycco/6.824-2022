@@ -342,7 +342,7 @@ func (kv *ShardKV) processClientOp(op Op, index int) OpReply {
 			// index 43 apply完执行产生snapshot，但是index 44已经apply并回复给client，
 			// client发送下一个append请求，将op提交给raft，index为45，此时op cache中
 			// 为index 45，然后restore snapshot回退index到43，重新apply index 44，
-			// 由于index 44 < op cache index 45，但是op cache err为空，则会执行index 44，
+			// 虽然index 44 < op cache index 45，但是op cache err为空，则会执行index 44，
 			// 导致index 44的数据重复执行
 			if (seqId > opCache.SeqId && index >= opCache.Index) || opCache.Err == Empty {
 				opReply = kv.opExecute(op)
@@ -383,6 +383,8 @@ func (kv *ShardKV) processInternalOp(op Op, index int, process func() OpReply) O
 		kv.logPrefix, index, kv.currCfg.Num, opCache)
 	if ok {
 		if (seqId >= opCache.SeqId && index >= opCache.Index) || opCache.Err == Empty {
+			// 版本更新：index 59和index 60先后执行两次，apply index 59时，cache的index为60
+			// 虽然index 59 < index 60，但op cache err为空，会更新cache index为59
 			kv.clientOp[cliId] = &OpCache{index, op.Opcode, kv.currCfg.Num, seqId, OK}
 			opReply = process()
 		}
@@ -578,12 +580,14 @@ func (kv *ShardKV) startOp(op Op) OpReply {
 		opCache := &OpCache{index, op.Opcode, kv.currCfg.Num, op.SeqId, Empty}
 		kv.clientOp[op.ClientId] = opCache
 
-		replyCh := make(chan OpReply)
+		// 无缓冲 channel：发送和接收必须同步进行，这里会解锁后select，若在没有进入select
+		// 就往channel写数据容易阻塞applier协程，因此改为带缓冲的channel。
+		replyCh := make(chan OpReply, 1)
 		kv.replyChs[index] = replyCh
 
 		kv.mu.Unlock()
-		// index 5已经timeout，目前replyCh是index 6，apply却是index 5，此时向index 5写入数据阻塞
-		// 在applier中需要判断index是否匹配
+		// 版本更新：index 5已经timeout，目前replyCh是index 6，apply却是index 5，
+		// 此时向index 5写入数据阻塞，在applier中需要判断index是否匹配
 		select {
 		case opReply = <-replyCh:
 		case <-time.After(OpProcessTimeOut):
@@ -591,6 +595,6 @@ func (kv *ShardKV) startOp(op Op) OpReply {
 		}
 		kv.mu.Lock()
 	}
-	raft.LogPrint(raft.INFO, dKvServer, "%s end op reply %+v", kv.logPrefix, opReply)
+	raft.LogPrint(raft.INFO, dKvServer, "%s end op index %d reply %+v", kv.logPrefix, index, opReply)
 	return opReply
 }

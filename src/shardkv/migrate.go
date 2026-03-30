@@ -210,6 +210,16 @@ func (kv *ShardKV) MigratePush(args *MigrateArgs, reply *MigrateReply) {
 
 		// 去重，当迁移到一半时，group killed，重启后会推送重复数据
 		// 注意临界点，如configer协程刚好start op还未apply，此时收到旧的已经迁移的数据
+		// 1.重启group，shard 0 &{KvData:map[2:_] Keys:[2] LastKey:2}，index 120将LastKey设置为KEY_MAX未apply
+		// 2.接收到shard 0的重复数据map[2:_]，由于已经迁移到key=2，则将map[]存入迁移队列
+		// 3.apply index 120将LastKey设置为KEY_MAX，此时num = 14
+		// 4.configer协程拉取新配置shard 0需要迁移，产生index 122更新配置
+		// 5.migrater协程开始执行map[]迁移，产生index 123
+		// 6.先后apply index 122与123，将shard 0将LastKey设置KEY_MIN
+		// 7.migrater协程迁移完成，产生index 124，将LastKey设置为KEY_MAX
+		// 8.shard 0将不会迁出，导致阻塞无法继续执行
+		// 9.若map[]不添加到迁移队列直接回复OK，推送方将有可能收不到进度
+		isDuplicate := false
 		db, ok := kv.shardDbs[args.Shard]
 		if ok {
 			if db.IsLastKeyMax() {
@@ -219,8 +229,17 @@ func (kv *ShardKV) MigratePush(args *MigrateArgs, reply *MigrateReply) {
 			for key := range task.kvData {
 				if key <= db.GetLastKey() {
 					delete(task.kvData, key)
+					isDuplicate = true
 				}
 			}
+		}
+
+		if isDuplicate && len(task.kvData) == 0 {
+			// 因为目前是整个shard推送，所以直接回复迁移完成
+			// 如果要支持shard数据部分推送，还需设计一个合理方案
+			reply.Err = ErrMigrateComplete
+			kv.startMigrateOp(KEY_MAX, strconv.Itoa(args.Shard), nil)
+			return
 		}
 
 		raft.LogPrint(raft.INFO, dKvServer, "%s Leader=%v receive push data request args %v",
@@ -302,6 +321,8 @@ func (kv *ShardKV) doProgress(shard int, num int) {
 
 			raft.LogPrint(raft.INFO, dKvServer, "%s migrate complete reply %+v => G%d-S%d", kv.logPrefix, err, srcgid, si)
 			if err == OK {
+				// 尽可能快的退出循环，否则会阻塞migrater，影响迁移（TestChallenge2Unaffected）
+				kv.gidLeaderId[srcgid] = si
 				break
 			} else {
 				si = (si + 1) % len(servers)
