@@ -209,7 +209,10 @@ func (kv *ShardKV) MigratePush(args *MigrateArgs, reply *MigrateReply) {
 		decoder.Decode(&task.cliSeq)
 
 		// 去重，当迁移到一半时，group killed，重启后会推送重复数据
-		// 注意临界点，如configer协程刚好start op还未apply，此时收到旧的已经迁移的数据
+		// 情形一：KEY_MAX需单独处理不能作为Key大小比较
+		// 如configer协程刚好start op还未apply，此时收到旧的已经迁移的数据
+
+		// 情形二：支持空map[]进入迁移任务队列
 		// 1.重启group，shard 0 &{KvData:map[2:_] Keys:[2] LastKey:2}，index 120将LastKey设置为KEY_MAX未apply
 		// 2.接收到shard 0的重复数据map[2:_]，由于已经迁移到key=2，则将map[]存入迁移队列
 		// 3.apply index 120将LastKey设置为KEY_MAX，此时num = 14
@@ -219,33 +222,42 @@ func (kv *ShardKV) MigratePush(args *MigrateArgs, reply *MigrateReply) {
 		// 7.migrater协程迁移完成，产生index 124，将LastKey设置为KEY_MAX
 		// 8.shard 0将不会迁出，导致阻塞无法继续执行
 		// 9.若map[]不添加到迁移队列直接回复OK，推送方将有可能收不到进度
-		isDuplicate := false
-		db, ok := kv.shardDbs[args.Shard]
-		if ok {
+
+		// 情形三：apply与重复推送的异步执行
+		// 1. 新组，Key=7只是提交了Raft：index 6，即LastKey为KEY_MIN，新组与旧组同时killed
+		// 2. 重启后，在index 6 apply之前，收到旧组推过来的数据存入迁移任务队列
+		// 3. apply index 6，shard 5 &{KvData:map[7:e] Keys:[7] LastKey:7}
+		// 4. 接收客户端的请求，提交Raft：index 7，apply操作成功：shard 5 &{KvData:map[7:ei] Keys:[7] LastKey:7}
+		// 5. 再次执行迁移任务队列的任务，shard 5数据最终变成&{KvData:map[7:e] Keys:[7] LastKey:=}，数据被覆盖
+
+		if db, ok := kv.shardDbs[args.Shard]; ok {
 			if db.IsLastKeyMax() {
 				reply.Err = OK
 				return
 			}
+
 			for key := range task.kvData {
 				if key <= db.GetLastKey() {
 					delete(task.kvData, key)
-					isDuplicate = true
 				}
 			}
 		}
 
-		if isDuplicate && len(task.kvData) == 0 {
+		if len(task.kvData) == 0 {
 			// 因为目前是整个shard推送，所以直接回复迁移完成
 			// 如果要支持shard数据部分推送，还需设计一个合理方案
-			reply.Err = ErrMigrateComplete
-			kv.startMigrateOp(KEY_MAX, strconv.Itoa(args.Shard), nil)
+			succ := kv.startMigrateOp(KEY_MAX, strconv.Itoa(args.Shard), nil)
+			if succ {
+				reply.Err = ErrMigrateComplete
+			} else {
+				reply.Err = OK
+			}
 			return
 		}
 
 		raft.LogPrint(raft.INFO, dKvServer, "%s Leader=%v receive push data request args %v",
 			kv.logPrefix, isLeader, task.kvData)
 
-		// 空的kvdata同样会跑一遍，TestStaticShards
 		kv.migrateTasks[args.Shard] = task
 		reply.Err = OK
 	} else if args.Num < kv.currCfg.Num {
@@ -286,11 +298,9 @@ func (kv *ShardKV) sendMigrateProgress(srv *labrpc.ClientEnd, args *MigrateProgr
 }
 
 func (kv *ShardKV) doProgress(shard int, num int) {
-	var oldCfg Cfg
+	oldCfg := kv.lastCfg
 	if kv.lastCfg.Num != num-1 {
 		oldCfg = Cfg(kv.cfgck.Query(num - 1))
-	} else {
-		oldCfg = kv.lastCfg
 	}
 
 	replyChan := make(chan Err)
@@ -355,31 +365,41 @@ func (kv *ShardKV) migrater() {
 	for !kv.killed() {
 		kv.mu.Lock()
 
-		var ok bool
+		ok := true
 		for shard, task := range kv.migrateTasks {
 
-			keys := make([]string, 0)
-			for key := range task.kvData {
-				keys = append(keys, key)
+			// 情形三：apply与重复推送的异步执行
+			if db, exist := kv.shardDbs[shard]; exist {
+				for key := range task.kvData {
+					if key <= db.GetLastKey() {
+						delete(task.kvData, key)
+					}
+				}
 			}
-			sort.Strings(keys)
 
-			ok = kv.startMigrateOp(KEY_MIN, strconv.Itoa(shard), task.cliSeq)
+			if len(task.kvData) > 0 {
+				keys := make([]string, 0)
+				for key := range task.kvData {
+					keys = append(keys, key)
+				}
+				sort.Strings(keys)
 
-			for _, key := range keys {
-				ok = kv.startMigrateOp(key, task.kvData[key], nil)
-				if !ok {
-					break
+				ok = kv.startMigrateOp(KEY_MIN, strconv.Itoa(shard), task.cliSeq)
+
+				for _, key := range keys {
+					if ok = kv.startMigrateOp(key, task.kvData[key], nil); !ok {
+						break
+					}
 				}
 			}
 
 			if ok {
-				ok = kv.startMigrateOp(KEY_MAX, strconv.Itoa(shard), nil)
-				// 有可能leader切换，迁移失败，此时不能更新进度
-				if ok {
+				if ok = kv.startMigrateOp(KEY_MAX, strconv.Itoa(shard), nil); ok {
+					// 有可能leader切换，迁移失败，此时不能更新进度
 					kv.doProgress(shard, task.num)
 				}
 			}
+
 			delete(kv.migrateTasks, shard)
 		}
 		kv.mu.Unlock()
